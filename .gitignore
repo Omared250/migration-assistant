@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# nr1 CLI build output. `nerdpack:build` writes dist/, and `nerdpack:serve` writes a
+# timestamped copy of each .scss into tmp/ on every rebuild - so both churn constantly and
+# neither is a source of truth.
+dist/
+tmp/
+
+# Exported migration bundles. These hold real account configuration and are downloaded to
+# wherever the browser puts them; keep them out of the repo if one lands here.
+nr-migration-*.json
+
+# Local env / editor noise
+.DS_Store
+*.log
+.env
+.env.local
+.idea/
+.vscode/
