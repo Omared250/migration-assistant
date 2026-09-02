@@ -90,6 +90,19 @@ export function buildDashboardImportTaskList(payload, selections) {
 export async function applyDashboardsBundle({ client, accountId, payload, selections, sourceAccountId, onProgress }) {
   const chosen = (payload.dashboards || []).filter(d => selections[d.name]);
 
+  // Checked once, before anything is created. Without the source account ID there is no way to
+  // know which account references to replace, and the old code responded by leaving widgets
+  // pointing at the source - producing dashboards that look imported but whose widgets cannot
+  // even be opened. Better to refuse the whole import.
+  if (!Number.isFinite(parseInt(sourceAccountId, 10))) {
+    const message =
+      `This bundle does not record which account it came from (source.accountId is missing), so ` +
+      `widget queries cannot be re-pointed at account ${accountId}. Re-export it with the current ` +
+      `version of the app.`;
+    chosen.forEach((_, i) => onProgress(i, { status: 'FAILED', error: message }));
+    return;
+  }
+
   for (let i = 0; i < chosen.length; i++) {
     const dashboard = chosen[i];
     onProgress(i, { status: 'MIGRATING' });

@@ -182,6 +182,42 @@ export async function createTargetDashboard(client, accountId, dashboardInput) {
   return data?.dashboardCreate?.entityResult;
 }
 
+/**
+ * Both account IDs must be real numbers before any rewriting is attempted.
+ *
+ * This used to be assumed. When the source ID arrived as undefined, `parseInt` produced NaN
+ * and every comparison against it was false, so the rewrite silently did the opposite of its
+ * job: `accountIds` kept the source and gained the target ([source, target]), and a singular
+ * `accountId` was left pointing at the source entirely. The result was a dashboard whose
+ * widgets query an account the viewer cannot see - which is also why they refuse to open in
+ * the widget editor. Failing loudly here is the difference between a clear error and a
+ * dashboard that looks migrated but is not.
+ */
+function assertAccountIds(sourceAccountId, targetAccountId) {
+  const srcAccId = parseInt(sourceAccountId, 10);
+  const tgtAccId = parseInt(targetAccountId, 10);
+
+  if (!Number.isFinite(srcAccId)) {
+    throw new Error(
+      `Cannot re-point widget queries: the source account ID is missing or not numeric (got ${JSON.stringify(sourceAccountId)}). ` +
+      `For an import, this comes from the bundle's source.accountId.`
+    );
+  }
+  if (!Number.isFinite(tgtAccId)) {
+    throw new Error(
+      `Cannot re-point widget queries: the target account ID is missing or not numeric (got ${JSON.stringify(targetAccountId)}).`
+    );
+  }
+
+  return { srcAccId, tgtAccId };
+}
+
+/**
+ * Rewrites account references inside a widget's rawConfiguration, wherever they are nested.
+ *
+ * Only `accountId` and `accountIds` are touched, and only when they actually hold the source
+ * account - a widget deliberately querying a third account is left alone.
+ */
 function cleanAccountIdsRecursively(obj, srcAccId, tgtAccId) {
   if (!obj || typeof obj !== 'object') {
     return obj;
@@ -194,22 +230,19 @@ function cleanAccountIdsRecursively(obj, srcAccId, tgtAccId) {
   const cleanObj = {};
   for (const [key, value] of Object.entries(obj)) {
     if (key === 'accountIds' && Array.isArray(value)) {
-      let updatedIds = value
-        .map(id => parseInt(id))
-        .filter(id => id !== srcAccId);
-      
-      if (!updatedIds.includes(tgtAccId)) {
-        updatedIds.push(tgtAccId);
-      }
-      
-      cleanObj[key] = updatedIds;
+      // Swap the source for the target in place, preserving order and any other accounts the
+      // widget legitimately queries. Appending unconditionally is what produced
+      // [source, target] pairs before.
+      const updatedIds = value.map(id => {
+        const parsed = parseInt(id, 10);
+        return parsed === srcAccId ? tgtAccId : parsed;
+      });
+
+      // A query with no accounts at all cannot render; fall back to the target.
+      cleanObj[key] = updatedIds.length > 0 ? [...new Set(updatedIds)] : [tgtAccId];
     } else if (key === 'accountId') {
-      const parsedId = parseInt(value);
-      if (parsedId === srcAccId) {
-        cleanObj[key] = tgtAccId;
-      } else {
-        cleanObj[key] = value;
-      }
+      const parsed = parseInt(value, 10);
+      cleanObj[key] = parsed === srcAccId ? tgtAccId : value;
     } else {
       cleanObj[key] = cleanAccountIdsRecursively(value, srcAccId, tgtAccId);
     }
@@ -217,9 +250,22 @@ function cleanAccountIdsRecursively(obj, srcAccId, tgtAccId) {
   return cleanObj;
 }
 
-export function mapVariables(variablesList, sourceAccountId, targetAccountId) {
-  const srcAccId = parseInt(sourceAccountId);
-  const tgtAccId = parseInt(targetAccountId);
+/**
+ * Copies dashboard variables through to the target.
+ *
+ * `rewriteAccountIds` is OFF by default: the migration's job is to re-point widget queries at
+ * the target account, not to reshape variables. When it was on, a variable's
+ * nrqlQuery.accountIds came out holding both the source and the target account, which reads
+ * as the migration having "added" account IDs to variables that never had them.
+ *
+ * The consequence of leaving it off is honest and visible: a NRQL-backed variable keeps
+ * querying whichever account the source defined, so if that account is unreachable from the
+ * target the variable's dropdown will not populate. That is a one-line fix in the dashboard
+ * UI, and preferable to this tool silently rewriting definitions it was not asked to touch.
+ */
+export function mapVariables(variablesList, sourceAccountId, targetAccountId, { rewriteAccountIds = false } = {}) {
+  const srcAccId = parseInt(sourceAccountId, 10);
+  const tgtAccId = parseInt(targetAccountId, 10);
 
   return (variablesList || []).map(variable => {
     const cleanVar = {
@@ -246,18 +292,20 @@ export function mapVariables(variablesList, sourceAccountId, targetAccountId) {
     }
 
     if (variable.nrqlQuery) {
-      let cleanAccountIds = [tgtAccId];
-      if (variable.nrqlQuery.accountIds && variable.nrqlQuery.accountIds.length > 0) {
-        cleanAccountIds = variable.nrqlQuery.accountIds
-          .map(id => parseInt(id))
-          .filter(id => id !== srcAccId);
-        if (!cleanAccountIds.includes(tgtAccId)) {
-          cleanAccountIds.push(tgtAccId);
-        }
+      const sourceIds = (variable.nrqlQuery.accountIds || []).map(id => parseInt(id, 10)).filter(Number.isFinite);
+
+      let accountIds;
+      if (!rewriteAccountIds) {
+        // Verbatim. Fall back to the target only when the source recorded nothing, because
+        // accountIds is required by the API.
+        accountIds = sourceIds.length > 0 ? sourceIds : [tgtAccId];
+      } else {
+        const swapped = sourceIds.map(id => (id === srcAccId ? tgtAccId : id));
+        accountIds = swapped.length > 0 ? [...new Set(swapped)] : [tgtAccId];
       }
-      
+
       cleanVar.nrqlQuery = {
-        accountIds: cleanAccountIds,
+        accountIds,
         query: variable.nrqlQuery.query || ""
       };
     }
@@ -269,8 +317,7 @@ export function mapVariables(variablesList, sourceAccountId, targetAccountId) {
 export function mapPageToDashboardPageInput(page, sourceAccountId, targetAccountId) {
   if (!page) return null;
 
-  const srcAccId = parseInt(sourceAccountId);
-  const tgtAccId = parseInt(targetAccountId);
+  const { srcAccId, tgtAccId } = assertAccountIds(sourceAccountId, targetAccountId);
 
   return {
     name: page.name,
@@ -300,14 +347,24 @@ export function mapPageToDashboardPageInput(page, sourceAccountId, targetAccount
   };
 }
 
-export function mapEntityToDashboardInput(entity, sourceAccountId, targetAccountId) {
+/**
+ * Builds the DashboardInput for the target account.
+ *
+ * Scope is deliberately narrow: only account references inside widget rawConfiguration are
+ * rewritten. Permissions come straight from the source, and variables are copied verbatim
+ * unless `rewriteVariableAccountIds` is explicitly requested. Widening this beyond the
+ * account swap means the tool changes definitions nobody asked it to change.
+ */
+export function mapEntityToDashboardInput(entity, sourceAccountId, targetAccountId, { rewriteVariableAccountIds = false } = {}) {
   if (!entity) return null;
 
   return {
-    name: entity.name, 
+    name: entity.name,
+    // Preserved as-is. The dashboard is not made more permissive just to be editable - a
+    // widget that will not open is an account-reference problem, not a permissions one.
     permissions: entity.permissions || "PUBLIC_READ_WRITE",
     pages: (entity.pages || []).map(page => mapPageToDashboardPageInput(page, sourceAccountId, targetAccountId)),
-    variables: mapVariables(entity.variables, sourceAccountId, targetAccountId)
+    variables: mapVariables(entity.variables, sourceAccountId, targetAccountId, { rewriteAccountIds: rewriteVariableAccountIds })
   };
 }
 
