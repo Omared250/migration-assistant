@@ -1,0 +1,7 @@
+{
+  "schemaType": "LAUNCHER",
+  "id": "launcher",
+  "displayName": "New Relic Migration Assistant",
+  "description": "Launch the advanced Migration tool.",
+  "rootNerdletId": "e2dd482d-8e93-43eb-ac9c-73697bd668ae.home"
+}
