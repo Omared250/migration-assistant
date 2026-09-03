@@ -23,16 +23,23 @@ import {
 } from '../utils';
 import { SOURCE_ACCOUNT_SENTINEL } from '../bundle';
 
-/** Progress rows in the exact order applyAlertsBundle processes them. */
-export function buildImportTaskList(payload, selections) {
+/**
+ * Progress rows in the exact order applyAlertsBundle processes them.
+ *
+ * The whole bundle is applied - there is no selection step here. Choosing what to move happens
+ * at export, in the account the user actually knows; by import time they are in a different
+ * organization looking at names from a file, with no way to judge which ones matter. It also
+ * keeps the bundle honest: the file is the unit of work, so what you exported is what lands.
+ */
+export function buildImportTaskList(payload) {
   const rows = [];
   const add = (stepName) => rows.push({ stepName, status: 'PENDING', error: '', detail: '' });
 
-  (payload.destinations || []).filter(d => selections.destinations[d.name]).forEach(d => add(`Destination: ${d.name} (${d.type})`));
-  (payload.channels || []).filter(c => selections.destinations[c.destinationName]).forEach(c => add(`Channel: ${c.name}`));
-  (payload.policies || []).filter(p => selections.policies[p.name]).forEach(p => add(`Policy: ${p.name}`));
-  (payload.workflows || []).filter(w => selections.workflows[w.name]).forEach(w => add(`Workflow: ${w.name}`));
-  (payload.mutingRules || []).filter(r => selections.mutingRules[r.name]).forEach(r => add(`Muting rule: ${r.name}`));
+  (payload.destinations || []).forEach(d => add(`Destination: ${d.name} (${d.type})`));
+  (payload.channels || []).forEach(c => add(`Channel: ${c.name}`));
+  (payload.policies || []).forEach(p => add(`Policy: ${p.name}`));
+  (payload.workflows || []).forEach(w => add(`Workflow: ${w.name}`));
+  (payload.mutingRules || []).forEach(r => add(`Muting rule: ${r.name}`));
 
   return rows;
 }
@@ -40,16 +47,15 @@ export function buildImportTaskList(payload, selections) {
 /**
  * @param {object}   args.client      session client for the target account
  * @param {string}   args.accountId   target account
- * @param {object}   args.payload     bundle payload
- * @param {object}   args.selections  { destinations, policies, workflows, mutingRules } name -> bool
+ * @param {object}   args.payload     bundle payload - applied in full
  * @param {function} args.onProgress  (index, patch) => void, indexes matching buildImportTaskList
  */
-export async function applyAlertsBundle({ client, accountId, payload, selections, onProgress }) {
-  const chosenDestinations = (payload.destinations || []).filter(d => selections.destinations[d.name]);
-  const chosenChannels = (payload.channels || []).filter(c => selections.destinations[c.destinationName]);
-  const chosenPolicies = (payload.policies || []).filter(p => selections.policies[p.name]);
-  const chosenWorkflows = (payload.workflows || []).filter(w => selections.workflows[w.name]);
-  const chosenRules = (payload.mutingRules || []).filter(r => selections.mutingRules[r.name]);
+export async function applyAlertsBundle({ client, accountId, payload, onProgress }) {
+  const chosenDestinations = payload.destinations || [];
+  const chosenChannels = payload.channels || [];
+  const chosenPolicies = payload.policies || [];
+  const chosenWorkflows = payload.workflows || [];
+  const chosenRules = payload.mutingRules || [];
 
   // name -> id, built as we go and consumed by the later phases.
   const destIdByName = new Map();
@@ -188,8 +194,8 @@ export async function applyAlertsBundle({ client, accountId, payload, selections
       if (missingPolicies.length > 0) {
         throw new Error(
           `It filters on polic${missingPolicies.length === 1 ? 'y' : 'ies'} ${missingPolicies.join(', ')}, which ` +
-          `${missingPolicies.length === 1 ? 'was' : 'were'} not imported. Select ${missingPolicies.length === 1 ? 'it' : 'them'} and re-import, ` +
-          `or the workflow would never match an issue here.`
+          `${missingPolicies.length === 1 ? 'is' : 'are'} not in this bundle. Re-export from the source with ` +
+          `${missingPolicies.length === 1 ? 'that policy' : 'those policies'} included, or the workflow would never match an issue here.`
         );
       }
 
@@ -253,8 +259,8 @@ export async function applyAlertsBundle({ client, accountId, payload, selections
 
       if (missing.length > 0) {
         throw new Error(
-          `It references ${[...new Set(missing)].join(', ')}, which ${missing.length === 1 ? 'was' : 'were'} not imported. ` +
-          `Select ${missing.length === 1 ? 'it' : 'them'} and re-import, or the rule would mute nothing.`
+          `It references ${[...new Set(missing)].join(', ')}, which ${missing.length === 1 ? 'is' : 'are'} not in this bundle. ` +
+          `Re-export from the source with ${missing.length === 1 ? 'it' : 'them'} included, or the rule would mute nothing.`
         );
       }
 

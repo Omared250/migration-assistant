@@ -25,8 +25,8 @@ import { runStage1Migration } from './alerts/runStage1Migration';
 import { runStage2Migration, buildStage2TaskList } from './alerts/runStage2Migration';
 import Stage1Selection from './alerts/Stage1Selection';
 import Stage2Selection from './alerts/Stage2Selection';
-import ImportSelection from './alerts/ImportSelection';
-import { gatherAlertsForExport } from './alerts/exportAlerts';
+import ExportSelection from './alerts/ExportSelection';
+import { discoverAlertsInventory, gatherAlertsForExport } from './alerts/exportAlerts';
 import { applyAlertsBundle, buildImportTaskList } from './alerts/importAlerts';
 
 const EMPTY_NON_NRQL_REPORT = { supported: false, conditions: [] };
@@ -41,8 +41,8 @@ const selectAllById = (items) => items.reduce((acc, i) => ({ ...acc, [i.id]: tru
 const selectAllByName = (items) => (items || []).reduce((acc, i) => ({ ...acc, [i.name]: true }), {});
 
 // LIVE:   0 setup, 1 stage1 select, 2 stage2 select, 3 working, 4 summary
-// EXPORT: 0 setup, 3 working, 4 summary  (everything is exported; no pre-selection)
-// IMPORT: 0 setup, 1 select from bundle, 3 working, 4 summary
+// EXPORT: 0 setup, 2 select what to export, 3 working, 4 summary
+// IMPORT: 0 setup, 3 working, 4 summary  (the whole bundle is applied; selection was at export)
 export default function AlertsModule({ client, connection, updateConnection, onExit }) {
   const guard = useMountedGuard();
 
@@ -68,8 +68,11 @@ export default function AlertsModule({ client, connection, updateConnection, onE
   const [warnings, setWarnings] = useState([]);
 
   const [bundle, setBundle] = useState(null);
-  const [importSelections, setImportSelections] = useState({
-    destinations: {}, policies: {}, workflows: {}, mutingRules: {}
+  // Export inventory (cheap lists) plus what the user ticked. Keyed by source ID, since export
+  // runs in the account that owns them.
+  const [inventory, setInventory] = useState(null);
+  const [exportSelections, setExportSelections] = useState({
+    destinations: {}, policies: {}, conditions: {}, workflows: {}, mutingRules: {}
   });
 
   const { sourceAccountId, targetAccountId } = connection;
@@ -92,7 +95,8 @@ export default function AlertsModule({ client, connection, updateConnection, onE
     setNotifyProgress([]);
     setAlertProgress([]);
     setWarnings([]);
-    setImportSelections({ destinations: {}, policies: {}, workflows: {}, mutingRules: {} });
+    setInventory(null);
+    setExportSelections({ destinations: {}, policies: {}, conditions: {}, workflows: {}, mutingRules: {} });
   };
 
   const chooseScenario = (choice) => {
@@ -217,11 +221,40 @@ export default function AlertsModule({ client, connection, updateConnection, onE
   /*************************************************************
    * EXPORT
    *************************************************************/
-  const handleExport = async () => {
+  /** STEP 0 -> 2: list what is exportable so the user can choose. */
+  const handleExportDiscover = async () => {
     if (!sourceAccountId) {
       alert('An Account ID is required.');
       return;
     }
+    setStep(3);
+    setErrorMsg('');
+
+    try {
+      await verifySingleAccount(client, sourceAccountId);
+      const inv = await discoverAlertsInventory({ client, accountId: sourceAccountId });
+
+      guard(() => {
+        setInventory(inv);
+        setExportSelections({
+          destinations: selectAllById(inv.destinations),
+          policies: selectAllById(inv.policies),
+          conditions: selectAllById(inv.policies.flatMap(p => p.conditions || [])),
+          workflows: selectAllById(inv.workflows),
+          mutingRules: selectAllById(inv.mutingRules)
+        });
+        setStep(2);
+      });
+    } catch (e) {
+      guard(() => {
+        setErrorMsg(e.message);
+        setStep(0);
+      });
+    }
+  };
+
+  /** STEP 2 -> 4: read details for the ticked items and download the bundle. */
+  const handleExport = async () => {
     setStep(3);
     setErrorMsg('');
     setAlertProgress([]);
@@ -232,6 +265,8 @@ export default function AlertsModule({ client, connection, updateConnection, onE
       const { payload, warnings: notes } = await gatherAlertsForExport({
         client,
         accountId: sourceAccountId,
+        inventory,
+        selections: exportSelections,
         onLog: (row) => {
           log.push(row);
           guard(() => setAlertProgress([...log]));
@@ -241,7 +276,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
       const total =
         payload.destinations.length + payload.policies.length +
         payload.workflows.length + payload.mutingRules.length;
-      if (total === 0) throw new Error('Nothing could be exported from this account - see the log above.');
+      if (total === 0) throw new Error('Nothing was exported - see the log above.');
 
       downloadBundle(createBundle({
         kind: BUNDLE_KIND.ALERTS,
@@ -260,15 +295,15 @@ export default function AlertsModule({ client, connection, updateConnection, onE
     } catch (e) {
       guard(() => {
         setErrorMsg(e.message);
-        setStep(0);
+        setStep(2);
       });
     }
   };
 
   /*************************************************************
-   * IMPORT
+   * IMPORT - applies the whole bundle; what to move was chosen at export.
    *************************************************************/
-  const handleReviewBundle = async () => {
+  const handleImport = async () => {
     if (!targetAccountId) {
       alert('An Account ID is required.');
       return;
@@ -280,41 +315,25 @@ export default function AlertsModule({ client, connection, updateConnection, onE
 
     setStep(3);
     setErrorMsg('');
+
     try {
       await verifySingleAccount(client, targetAccountId);
-      const p = bundle.payload;
+      guard(() => setAlertProgress(buildImportTaskList(bundle.payload)));
 
-      guard(() => {
-        setImportSelections({
-          destinations: selectAllByName(p.destinations),
-          policies: selectAllByName(p.policies),
-          workflows: selectAllByName(p.workflows),
-          mutingRules: selectAllByName(p.mutingRules)
-        });
-        setStep(1);
+      await applyAlertsBundle({
+        client,
+        accountId: targetAccountId,
+        payload: bundle.payload,
+        onProgress: updateAlertLog
       });
+
+      guard(() => setStep(4));
     } catch (e) {
       guard(() => {
         setErrorMsg(e.message);
         setStep(0);
       });
     }
-  };
-
-  const handleImport = async () => {
-    setStep(3);
-    setErrorMsg('');
-    setAlertProgress(buildImportTaskList(bundle.payload, importSelections));
-
-    await applyAlertsBundle({
-      client,
-      accountId: targetAccountId,
-      payload: bundle.payload,
-      selections: importSelections,
-      onProgress: updateAlertLog
-    });
-
-    guard(() => setStep(4));
   };
 
   if (!scenario) {
@@ -359,9 +378,9 @@ export default function AlertsModule({ client, connection, updateConnection, onE
         <div className="main-card">
           <h3>2. Export from this account</h3>
           <p className="card-desc">
-            Reads all destinations, channels, policies, conditions, workflows and muting rules from this
-            account and downloads them as a bundle. Nothing is written. References are recorded by name,
-            because IDs are not shared across organizations.
+            Lists this account's destinations, policies, conditions, workflows and muting rules so you can
+            pick what goes into the bundle. Nothing is written. References are recorded by name, because
+            IDs are not shared across organizations.
           </p>
           <SingleAccountConfig
             label="Source account (the one you are signed into)"
@@ -378,7 +397,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
             </p>
           </div>
           <div className="button-group">
-            <button onClick={handleExport} className="pure-btn primary-btn">Export Everything &amp; Download Bundle</button>
+            <button onClick={handleExportDiscover} className="pure-btn primary-btn">Continue: Choose What to Export</button>
           </div>
         </div>
       )}
@@ -386,7 +405,10 @@ export default function AlertsModule({ client, connection, updateConnection, onE
       {step === 0 && isImport && (
         <div className="main-card">
           <h3>2. Import into this account</h3>
-          <p className="card-desc">Creates alerting configuration here from a bundle exported in the source account.</p>
+          <p className="card-desc">
+            Creates everything in the bundle here. What to migrate was chosen during export, so there is
+            nothing further to pick - matching items already in this account are reused, not duplicated.
+          </p>
           <SingleAccountConfig
             label="Target account (the one you are signed into)"
             hint="Configuration is created here."
@@ -400,7 +422,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
             onClear={() => setBundle(null)}
           />
           <div className="button-group">
-            <button onClick={handleReviewBundle} className="pure-btn primary-btn" disabled={!bundle}>Review Bundle Contents</button>
+            <button onClick={handleImport} className="pure-btn primary-btn" disabled={!bundle}>Create Everything in This Bundle</button>
           </div>
         </div>
       )}
@@ -421,13 +443,15 @@ export default function AlertsModule({ client, connection, updateConnection, onE
         />
       )}
 
-      {step === 1 && isImport && (
-        <ImportSelection
-          bundle={bundle}
-          selections={importSelections}
-          setSelections={setImportSelections}
+
+      {step === 2 && scenario === SCENARIO.EXPORT && inventory && (
+        <ExportSelection
+          inventory={inventory}
+          selections={exportSelections}
+          setSelections={setExportSelections}
+          accountId={sourceAccountId}
           onBack={resetToSetup}
-          onImport={handleImport}
+          onExport={handleExport}
         />
       )}
 
@@ -450,7 +474,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
         <LoadingCard
           message={
             scenario === SCENARIO.EXPORT
-              ? 'Reading alerting configuration and resolving references to names.'
+              ? 'Reading the selected configuration and resolving references to names.'
               : 'Establishing destinations, compiling channels, deploying policies, and rebuilding workflows and muting rules.'
           }
         />

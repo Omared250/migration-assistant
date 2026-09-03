@@ -25,14 +25,53 @@ import {
   fetchSingleConditionDetails,
   discoverWorkflows,
   discoverMutingRules,
+  discoverNonNrqlConditions,
   canRecreateDestinationType
 } from '../utils';
 import { SOURCE_ACCOUNT_SENTINEL } from '../bundle';
 
 /**
+ * Lists everything exportable, without fetching per-item detail.
+ *
+ * Kept separate from gatherAlertsForExport so the picker can be shown against a cheap list.
+ * Detail fetches (condition definitions, destination and channel properties) then happen only
+ * for what the user actually ticked.
+ */
+export async function discoverAlertsInventory({ client, accountId }) {
+  const { destinations, channels } = await fetchDestinationsAndChannels(client, accountId);
+  const discoveredPolicies = await discoverAlertPolicies(client, accountId, { type: 'ALL' });
+
+  const policies = [];
+  for (const p of discoveredPolicies) {
+    let conditions = [];
+    try {
+      conditions = await fetchPolicyConditionsList(client, accountId, p.id);
+    } catch (e) {
+      console.warn(`Could not list conditions for policy ${p.name}: ${e.message}`);
+    }
+    policies.push({ ...p, conditions });
+  }
+
+  const workflows = await discoverWorkflows(client, accountId);
+
+  // Non-fatal: an account may have none, and a read failure should not block the export.
+  let mutingRules = [];
+  try {
+    mutingRules = await discoverMutingRules(client, accountId);
+  } catch (e) {
+    console.warn(`Could not read muting rules: ${e.message}`);
+  }
+
+  const allNrqlIds = policies.flatMap(p => (p.conditions || []).map(c => c.id));
+  const nonNrqlReport = await discoverNonNrqlConditions(client, accountId, allNrqlIds);
+
+  return { destinations, channels, policies, workflows, mutingRules, nonNrqlReport };
+}
+
+/**
  * Attributes in a muting rule condition whose values are account-scoped IDs, mapped to the
  * field the name list is written to. Plural, because the values are always an array - and
- * because importAlerts.js and ImportSelection.js read these exact keys.
+ * because importAlerts.js reads these exact keys.
  */
 const MUTING_ID_ATTRS = { policyId: 'policyNames', conditionId: 'conditionNames' };
 
@@ -40,23 +79,34 @@ const MUTING_ID_ATTRS = { policyId: 'policyNames', conditionId: 'conditionNames'
 const MUTING_UNPORTABLE_ATTRS = new Set(['entity.guid', 'entityGuid', 'targetId']);
 
 /**
- * Gathers everything needed for an alerts bundle.
+ * Builds the bundle payload for the selected subset of an inventory.
  *
- * @param {object}   args.client         session client for the account being exported
+ * Name maps are built from the FULL inventory, not the selection: a selected workflow may
+ * reference an unselected policy, and recording that policy's name (plus a warning) is more
+ * useful than writing an unresolvable reference.
+ *
+ * @param {object}   args.client       session client for the account being exported
  * @param {string}   args.accountId
- * @param {function} args.onLog          (row) => void, progress for the UI
+ * @param {object}   args.inventory    from discoverAlertsInventory
+ * @param {object}   args.selections   { destinations, policies, conditions, workflows, mutingRules } id -> bool
+ * @param {function} args.onLog        (row) => void, progress for the UI
  * @returns {Promise<{payload: object, warnings: string[]}>}
  */
-export async function gatherAlertsForExport({ client, accountId, onLog }) {
+export async function gatherAlertsForExport({ client, accountId, inventory, selections, onLog }) {
   const warnings = [];
   const log = (stepName, status, detail = '', error = '') => onLog({ stepName, status, detail, error });
 
+  const { destinations, channels, policies: allPolicies, workflows: allWorkflows, mutingRules: allRules } = inventory;
+  const picked = (group, id) => !!selections?.[group]?.[id];
+
   // ---- Destinations & channels -------------------------------------------------
-  const { destinations, channels } = await fetchDestinationsAndChannels(client, accountId);
   const destById = new Map(destinations.map(d => [String(d.id), d]));
+  const chosenDestinations = destinations.filter(d => picked('destinations', d.id));
+  // Channels are not selected directly; they travel with their destination.
+  const chosenChannels = channels.filter(c => picked('destinations', c.destinationId));
 
   const exportedDestinations = [];
-  for (const dest of destinations) {
+  for (const dest of chosenDestinations) {
     try {
       const details = await fetchSingleDestinationDetails(client, accountId, dest.id);
       const portable = canRecreateDestinationType(dest.type);
@@ -85,7 +135,7 @@ export async function gatherAlertsForExport({ client, accountId, onLog }) {
   }
 
   const exportedChannels = [];
-  for (const chan of channels) {
+  for (const chan of chosenChannels) {
     const parentDest = destById.get(String(chan.destinationId));
     if (!parentDest) {
       log(`Channel: ${chan.name}`, 'FAILED', '', 'Its destination was not found, so it cannot be described by name.');
@@ -108,30 +158,24 @@ export async function gatherAlertsForExport({ client, accountId, onLog }) {
     }
   }
 
-  const channelNameById = new Map(
-    channels.map(c => [String(c.id), c.name])
-  );
+  const channelNameById = new Map(channels.map(c => [String(c.id), c.name]));
 
   // ---- Policies & conditions ---------------------------------------------------
-  const policies = await discoverAlertPolicies(client, accountId, { type: 'ALL' });
-  const policyNameById = new Map(policies.map(p => [String(p.id), p.name]));
+  const policyNameById = new Map(allPolicies.map(p => [String(p.id), p.name]));
   const conditionNameById = new Map();
+  allPolicies.forEach(p => (p.conditions || []).forEach(c => conditionNameById.set(String(c.id), c.name)));
 
+  // Names must resolve for unselected policies too (see the note above), so the map is built
+  // from everything while only the ticked policies are actually exported.
+  const chosenPolicies = allPolicies.filter(p => picked('policies', p.id));
   const exportedPolicies = [];
-  for (const policy of policies) {
-    let conditions = [];
-    try {
-      conditions = await fetchPolicyConditionsList(client, accountId, policy.id);
-    } catch (e) {
-      log(`Policy: ${policy.name}`, 'FAILED', '', `Could not list conditions: ${e.message}`);
-      continue;
-    }
 
+  for (const policy of chosenPolicies) {
+    const conditions = (policy.conditions || []).filter(c => picked('conditions', c.id));
     const exportedConditions = [];
     const failures = [];
 
     for (const cond of conditions) {
-      conditionNameById.set(String(cond.id), cond.name);
       try {
         const details = await fetchSingleConditionDetails(client, accountId, cond.id);
         // Stored as fetched. The importer feeds this straight into the same
@@ -157,10 +201,9 @@ export async function gatherAlertsForExport({ client, accountId, onLog }) {
   }
 
   // ---- Workflows ---------------------------------------------------------------
-  const workflows = await discoverWorkflows(client, accountId);
   const exportedWorkflows = [];
 
-  for (const wf of workflows) {
+  for (const wf of allWorkflows.filter(w => picked('workflows', w.id))) {
     const filter = wf.issuesFilter || {};
     const unresolved = [];
 
@@ -202,15 +245,8 @@ export async function gatherAlertsForExport({ client, accountId, onLog }) {
   }
 
   // ---- Muting rules ------------------------------------------------------------
-  let mutingRules = [];
-  try {
-    mutingRules = await discoverMutingRules(client, accountId);
-  } catch (e) {
-    warnings.push(`Muting rules could not be read: ${e.message}`);
-  }
-
   const exportedMutingRules = [];
-  for (const rule of mutingRules) {
+  for (const rule of allRules.filter(r => picked('mutingRules', r.id))) {
     const group = rule.condition;
     if (!group?.conditions?.length) {
       log(`Muting rule: ${rule.name}`, 'FAILED', '', 'Rule has no conditions.');
