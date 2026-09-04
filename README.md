@@ -1,22 +1,186 @@
-# migration-assistant
+# New Relic Migration Assistant
 
-## Getting started
+A New Relic nerdpack that copies **dashboards** and **alerting configuration** from one account to another — within an organization, or across organizations and regions.
 
-Run the following scripts:
+It is idempotent: matching items in the target are reused, not duplicated, so a failed run can be re-run safely.
+
+---
+
+## Choosing a scenario
+
+Every module asks this first, because the answer changes what is technically possible:
+
+| Scenario | When | Passes |
+|---|---|---|
+| **Same organization, same region** | Both accounts are sub-accounts of the org you're signed into | One — direct migration |
+| **Different org or region — Export** | You're signed into the **source** | 1 of 2 — download a bundle |
+| **Different org or region — Import** | You're signed into the **target** | 2 of 2 — upload that bundle |
+
+### Why cross-org/region needs two passes
+
+A New Relic user identity belongs to **one organization** — the same email in two orgs is two separate user records. The nerdlet's session token therefore cannot reach an account outside the org you're signed into. Each region is also a separate API endpoint.
+
+The workaround — a User API key for the other side — **does not work from a browser**. A custom `API-Key` header forces a CORS preflight, and NerdGraph does not answer it for browser origins; API keys there are for server-to-server use. This is not a bug in the app and cannot be fixed in it.
+
+So the data moves as a **JSON bundle file** instead. Each pass only ever touches the account you're already signed into, which also means no credentials are involved anywhere.
+
+---
+
+## Dashboards
+
+### What you can do
+
+1. **Discover** by *all dashboards*, *keyword in the name*, or *tag key/value*.
+2. **Migrate live** (same org + region) — read source, create in target, one pass.
+3. **Export / Import** (cross org or region) — download selected dashboards, then create them in the target.
+
+### What it changes, and what it doesn't
+
+The **only** thing rewritten is the account reference inside widget queries — `accountId` and `accountIds` anywhere in a widget's `rawConfiguration`, swapped in place from the source account to the target.
+
+Deliberately left alone:
+
+- **NRQL query text** — untouched.
+- **Dashboard permissions** — copied as-is. A `PRIVATE` dashboard stays `PRIVATE`; nothing is made more permissive.
+- **Variables** — copied, including their `accountIds`.
+- **Widgets querying a third account** — preserved. Only the source account is substituted.
+
+### Legacy tabbed dashboards
+
+Older dashboards exist as several sibling entities named `Parent / Page`. These are detected, grouped, and consolidated into a single multi-page dashboard with de-duplicated page names. The selection list badges them as *Legacy tab group*.
+
+### Not migrated
+
+- **Dashboard tags** — not copied.
+
+---
+
+## Alerts & Incident Systems
+
+### What you can do
+
+1. **Migrate live** (same org + region), in two stages.
+2. **Export** — pick what to include, download a bundle.
+3. **Import** — apply a whole bundle.
+
+Covers: **notification destinations**, **channels**, **alert policies**, **NRQL conditions** (static and baseline), **workflows**, and **muting rules**.
+
+### Selecting what to move
+
+**Export** shows four tabs — Policies (with per-condition checkboxes), Destinations, Workflows, Muting Rules — with live dependency warnings if you select a workflow without the policies it filters on.
+
+Channels are **not** selected separately: they belong to a destination and travel with it.
+
+**Import applies the entire bundle.** There is no second selection step, by design — at export you're looking at an account you know; at import you're in a different org reading names out of a file. Choosing there would be guesswork.
+
+### Creation order (why there are two stages)
+
+Dependencies force it:
 
 ```
-npm install
-npm start
+destinations → channels → policies + conditions → workflows → muting rules
 ```
 
-Visit https://one.newrelic.com/?nerdpacks=local and :sparkles:
+A workflow needs target channel IDs *and* target policy IDs. A muting rule needs target policy and condition IDs. Nothing here is arbitrary — don't reorder it.
 
-## Creating new artifacts
+### How cross-org references survive
 
-If you want to create new artifacts run the following command:
+IDs are meaningless in another organization, so export replaces every reference with the **name** of what it points at, and import resolves those names against what it just created:
+
+| Source field | In the bundle |
+|---|---|
+| `channel.destinationId` | `destinationName` |
+| workflow `channelId` | `channelName` |
+| workflow `labels.policyIds` | policy names |
+| muting rule `policyId` / `conditionId` | policy / condition names |
+| muting rule `accountId` | a placeholder, substituted with the target account |
+
+If a referenced item isn't in the bundle, the workflow or rule **fails with the missing name** rather than being created pointing at nothing.
+
+### Destinations that need authentication
+
+**Only `EMAIL` and `MOBILE_PUSH` destinations can be created by this tool.**
+
+NerdGraph never returns a destination's credentials — auth tokens, webhook secrets, API keys. They're write-only by design. So for Slack, PagerDuty, webhooks, Jira, ServiceNow and similar, the tool can read the *name and type* but not what makes them work. Creating one from that would produce a destination that accepts the mutation and then silently drops every notification — worse than not creating it.
+
+Instead:
+
+1. Those destinations are flagged **"Name only"** / **"Manual setup required"** before you migrate.
+2. Create them **by hand in the target account, using the exact same name**.
+3. Re-run the migration or import. The tool matches by name, reuses your destination, and links its channels.
+
+### Conditions that are not migrated
+
+**Only NRQL conditions can be migrated** — static and baseline. APM / browser / mobile metric conditions and multi-location synthetics conditions cannot be, because NerdGraph provides no way to *enumerate* them; the alerts API only exposes a search for NRQL conditions.
+
+The tool detects them anyway, via the entity platform, and lists them by name so you know exactly what to recreate by hand. If that detection is unavailable it says so rather than implying the account is clean.
+
+Multi-location synthetics conditions have a second problem: they reference monitor entities that don't exist in the target until the monitors themselves are migrated which is in plan to be cover in next app versions. Synthetics migration is not implemented yet.
+
+### Other alerts limitations
+
+- **Alert policies cannot be filtered by tag** — policies are not taggable entities in New Relic. Use *all* or *keyword*.
+- **Muting rules targeting specific entities** (`entity.guid`, `targetId`) cannot cross an org boundary — there's no equivalent entity on the other side. They're reported, not silently dropped.
+- **Muting rule schedules without a time zone** are refused; guessing one would shift the window.
+- A condition whose advanced settings are rejected is retried with core fields only, and reported as **needs attention** rather than a clean success, naming what was reset.
+
+---
+
+## Reading the results
+
+| | Meaning |
+|---|---|
+| ✅ **Success** | Created in the target |
+| ↩️ **Skipped** | Already existed with the same name — reused, not duplicated |
+| ⚠️ **Needs attention** | Partially done, or requires manual work. **Read these** |
+| ❌ **Failed** | Not created; the message says why |
+
+A failure never aborts the run — every other item still processes, and the summary always shows.
+
+---
+
+## Cross-region walkthrough
+
+1. Sign into the **source** account. Open the module → **Different organization or region — Export**.
+2. Enter the source account ID → **Continue: Choose What to Export**.
+3. Tick what you want. Resolve any dependency warnings. → **Export Selected & Download Bundle**.
+4. Note anything flagged *Name only* — create those destinations by hand in the target now.
+5. Sign into the **target** account (separate login; different org). Open the same module → **Import**.
+6. Enter the target account ID, choose the bundle file → **Create Everything in This Bundle**.
+7. Review the summary. Re-import after fixing anything flagged ⚠️ — reruns are safe.
+
+> Validate the whole path without a second region first: export from one sub-account and import into a sibling in the same org. That exercises every step except the region switch.
+
+---
+
+## Project layout
 
 ```
-nr1 create
+nerdlets/home/
+  index.js              shell: header, module picker, shared account IDs
+  ScenarioPicker.js     the same-org / export / import fork
+  nerdgraph.js          NerdGraph transport, error formatting, pagination
+  utils.js              all NerdGraph operations (takes a client as first arg)
+  bundle.js             transfer format, validation, download/read
+  access.js             account reachability checks
+  components.js         shared presentational pieces
+  hooks.js              useMountedGuard
+  DashboardsModule.js   dashboards state + flow
+  AlertsModule.js       alerts state + flow
+  dashboards/           live migration, export/import
+  alerts/               stage runners, export/import, selection screens
 ```
 
-> Example: `nr1 create --type nerdlet --name my-nerdlet`.
+`utils.js` imports no framework code — every function takes a `client` as its first argument, which keeps the API layer independent of the UI.
+
+---
+
+## Known constraints summary
+
+| Constraint | Reason |
+|---|---|
+| Cross-org/region needs two passes | Session is org-scoped; NerdGraph rejects browser API-key calls (CORS) |
+| Only EMAIL / MOBILE_PUSH destinations created | The API never returns credentials for the others |
+| Only NRQL conditions migrated | No API to enumerate other condition types |
+| Policies can't be filtered by tag | Policies aren't taggable entities |
+| Synthetics monitors not migrated | Not implemented yet |
