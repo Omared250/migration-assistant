@@ -13,7 +13,7 @@ import React, { useState } from 'react';
 import { discoverDashboards } from './utils';
 import {
   ModuleNavBar, AccountConfigGrid, SingleAccountConfig, BundleDropzone,
-  LoadingCard, ErrorCard, WarningList, SelectableList, StatusRow
+  BundleSummary, LoadingCard, ErrorCard, WarningList, SelectableList, StatusRow
 } from './components';
 import { useMountedGuard } from './hooks';
 import { verifyMigrationAccess, verifySingleAccount } from './access';
@@ -368,6 +368,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
             onLoad={setBundle}
             onClear={() => setBundle(null)}
           />
+          {bundle && <BundleSummary bundle={bundle} />}
           <div className="button-group">
             <button onClick={handleReviewBundle} className="pure-btn primary-btn" disabled={!bundle}>Review Bundle Contents</button>
           </div>

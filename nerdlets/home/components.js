@@ -141,6 +141,80 @@ export function BundleDropzone({ expectedKind, bundle, onLoad, onClear }) {
   );
 }
 
+/**
+ * Read-only summary of what an import is about to create. Not a selection - that happens at
+ * export - but the user still has to be able to see inside the file before it writes to a live
+ * account.
+ *
+ * A bundle is untrusted input: it is a plain JSON file that can be edited or come from someone
+ * else. The riskiest thing it can contain is a notification destination, because an EMAIL
+ * destination carries a real address in its properties and gets wired into workflows. Those
+ * addresses are shown explicitly so a bundle pointing somewhere unexpected is obvious before
+ * anything is created.
+ */
+export function BundleSummary({ bundle }) {
+  const p = bundle?.payload;
+  if (!p) return null;
+
+  const groups = [
+    ['Notification destinations', (p.destinations || []).length],
+    ['Notification channels', (p.channels || []).length],
+    ['Alert policies', (p.policies || []).length],
+    ['NRQL conditions', (p.policies || []).reduce((n, x) => n + (x.conditions || []).length, 0)],
+    ['Workflows', (p.workflows || []).length],
+    ['Muting rules', (p.mutingRules || []).length],
+    ['Dashboards', (p.dashboards || []).length]
+  ].filter(([, n]) => n > 0);
+
+  // Email addresses a created destination would notify.
+  const emailTargets = (p.destinations || [])
+    .filter(d => (d.type || '').toUpperCase() === 'EMAIL')
+    .map(d => ({
+      name: d.name,
+      addresses: (d.properties || [])
+        .filter(prop => /email|address|recipient/i.test(prop.key || ''))
+        .map(prop => prop.value)
+        .filter(Boolean)
+    }));
+
+  return (
+    <div className="conditional-input-box">
+      <h4 style={{ margin: '0 0 12px 0', fontSize: '14px' }}>This bundle will create</h4>
+
+      {groups.length === 0 ? (
+        <p className="field-hint">The bundle is empty - nothing would be created.</p>
+      ) : (
+        <div className="summary-list">
+          {groups.map(([label, n]) => (
+            <div key={label} className="summary-row">
+              <div className="summary-meta"><strong>{label}</strong></div>
+              <span className="badge neutral">{n}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {emailTargets.length > 0 && (
+        <div className="warning-card" style={{ marginBottom: 0 }}>
+          <h4>⚠️ Confirm these notification recipients</h4>
+          <p>
+            Email destinations in this bundle will be created here and can be wired into workflows.
+            Check the addresses before continuing:
+          </p>
+          <ul className="warning-list">
+            {emailTargets.map(t => (
+              <li key={t.name}>
+                <strong>{t.name}</strong>
+                {t.addresses.length > 0 ? ` → ${t.addresses.join(', ')}` : ' (no address recorded)'}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function LoadingCard({ message }) {
   return (
     <div className="main-card loading-card" style={{ textAlign: 'center', padding: '48px 0' }}>

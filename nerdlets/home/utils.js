@@ -16,8 +16,17 @@ import { collectAllPages } from './nerdgraph';
  *************************************************************/
 
 export async function discoverDashboards(client, accountId, criteria) {
-  const queryStr = `type = 'DASHBOARD' AND accountId = ${accountId}`;
-  
+  // Coerced to a number before interpolation. The account ID comes from a free-text input, and
+  // entitySearch takes a query *language* string - so pasting `123 OR name LIKE '%'` in that box
+  // would otherwise widen the search instead of being rejected. GraphQL variables do not protect
+  // against this: the injection is inside the search expression, not the GraphQL document.
+  const numericAccountId = parseInt(accountId, 10);
+  if (!Number.isFinite(numericAccountId)) {
+    throw new Error(`Account ID must be numeric (got ${JSON.stringify(accountId)}).`);
+  }
+
+  const queryStr = `type = 'DASHBOARD' AND accountId = ${numericAccountId}`;
+
   const query = `
     query DiscoverDashboards($queryStr: String!) {
       actor {

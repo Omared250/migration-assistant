@@ -15,7 +15,7 @@ import React, { useState } from 'react';
 import { fetchDestinationsAndChannels, discoverWorkflows, discoverMutingRules } from './utils';
 import {
   StatusRow, ModuleNavBar, AccountConfigGrid, SingleAccountConfig, BundleDropzone,
-  LoadingCard, ErrorCard, WarningList
+  BundleSummary, LoadingCard, ErrorCard, WarningList
 } from './components';
 import { useMountedGuard } from './hooks';
 import { verifyMigrationAccess, verifySingleAccount } from './access';
@@ -421,6 +421,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
             onLoad={setBundle}
             onClear={() => setBundle(null)}
           />
+          {bundle && <BundleSummary bundle={bundle} />}
           <div className="button-group">
             <button onClick={handleImport} className="pure-btn primary-btn" disabled={!bundle}>Create Everything in This Bundle</button>
           </div>

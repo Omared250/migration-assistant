@@ -118,11 +118,26 @@ export function downloadBundle(bundle) {
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
+/**
+ * Largest bundle we will read into memory. A realistic export of a large account is well under
+ * a megabyte; anything past this is a wrong file (or a deliberately huge one), and parsing it
+ * would freeze the tab rather than fail.
+ */
+const MAX_BUNDLE_BYTES = 25 * 1024 * 1024;
+
 /** Reads and parses a bundle chosen through a file input. */
 export function readBundleFile(file) {
   return new Promise((resolve, reject) => {
     if (!file) {
       reject(new Error('No file selected.'));
+      return;
+    }
+
+    if (file.size > MAX_BUNDLE_BYTES) {
+      reject(new Error(
+        `${file.name} is ${(file.size / 1024 / 1024).toFixed(1)} MB, larger than the ${MAX_BUNDLE_BYTES / 1024 / 1024} MB limit. ` +
+        `A migration bundle should be far smaller than this - check you selected the right file.`
+      ));
       return;
     }
 
