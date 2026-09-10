@@ -6,6 +6,101 @@ It is idempotent: matching items in the target are reused, not duplicated, so a 
 
 ---
 
+## Adding this app to your New Relic account
+
+This is a **nerdpack** — a custom app you deploy into your own New Relic account. It is not on the public catalogue, so you build and publish it yourself. Takes about ten minutes.
+
+### What you need
+
+- **Node.js 10 or newer** (18+ recommended).
+- **The New Relic One CLI (`nr1`).** Get it from New Relic itself: **[one.newrelic.com](https://one.newrelic.com)** → **+ Integrations & Agents** → **Build your own app**. That page gives you the installer for your OS. (Don't install it from public npm — the package is served by New Relic.)
+- **A User API key** for the account you're deploying into: **Administration → API keys → Create a key → User**. It must start with `NRAK-`.
+- **Permission to manage apps** in that account — the *Nerdpack manager* role, or admin. Without it, `nerdpack:publish` fails.
+
+### 1. Create a CLI profile
+
+```bash
+nr1 profiles:add --name my-account --region us --api-key NRAK-YOUR-KEY
+```
+
+Use `--region eu` if your account is in the EU data centre. Verify with `nr1 profiles:list`.
+
+### 2. Clone and install
+
+```bash
+git clone <this-repo-url> && cd migration-assistant
+npm install
+```
+
+### 3. Generate your own nerdpack UUID — required
+
+The UUID committed in `package.json` belongs to the account this app was developed in. **It will not work for you.** Replace it with one bound to your account:
+
+```bash
+nr1 nerdpack:uuid -gf
+```
+
+Skipping this is the most common reason publishing fails.
+
+### 4. Try it before publishing (optional)
+
+```bash
+nr1 nerdpack:serve
+```
+
+Open `https://one.newrelic.com/?nerdpacks=local` — or `https://one.eu.newrelic.com/?nerdpacks=local` for EU — and launch **New Relic Migration Assistant**. Nothing is uploaded; the app runs from your machine. Accept the `localhost` certificate warning if your browser shows one.
+
+### 5. Publish it
+
+```bash
+nr1 nerdpack:publish
+nr1 nerdpack:deploy
+nr1 subscription:set
+```
+
+- `publish` uploads the built version to your account.
+- `deploy` tags that version to the `STABLE` channel.
+- `subscription:set` subscribes the account so the launcher appears.
+
+Find it under **Apps** in the New Relic navigation, as **New Relic Migration Assistant**.
+
+### 6. Make it available to other sub-accounts
+
+A subscription is per-account. To use the app from another sub-account, subscribe that account too — either in the UI (**Apps → Manage your apps → your app → subscribe the accounts you want**) or from the CLI with a profile whose key belongs to that account:
+
+```bash
+nr1 subscription:set --profile other-account
+```
+
+You only need it subscribed in the account you'll *run* it from. It reads and writes other accounts through the API, not by being installed in them.
+
+### If you migrate across regions
+
+Nerdpacks are **region-scoped**: an app published in the US is not visible in the EU. To run it in both, publish it twice — and because a UUID is bound to one region, generate a second one for the EU deployment:
+
+```bash
+nr1 profiles:add --name my-eu-account --region eu --api-key NRAK-YOUR-EU-KEY
+nr1 nerdpack:uuid -gf --profile my-eu-account
+nr1 nerdpack:publish --profile my-eu-account
+nr1 nerdpack:deploy --profile my-eu-account
+nr1 subscription:set --profile my-eu-account
+```
+
+Since `package.json` holds one UUID at a time, keep the two on separate git branches (one per region) rather than editing the file back and forth.
+
+> For **local testing** you can skip all of this: a single `nr1 nerdpack:serve` works against both regions at once, because the bundle is served from your machine and the region comes from whichever New Relic page loads it.
+
+### Access the app needs at runtime
+
+The app uses your own New Relic session — it never asks for or stores an API key. Whoever runs it needs:
+
+- **read** access to the source account (dashboards, alert policies, notification destinations),
+- **write** access to the target account (create dashboards, policies, conditions, workflows, muting rules).
+
+If either is missing, the app says which account and why before it changes anything.
+
+---
+
 ## Choosing a scenario
 
 Every module asks this first, because the answer changes what is technically possible:
