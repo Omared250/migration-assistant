@@ -12,7 +12,7 @@
 // IMPORT applies the same chain in one pass, since the bundle already holds everything.
 
 import React, { useState } from 'react';
-import { fetchDestinationsAndChannels, discoverWorkflows, discoverMutingRules } from './utils';
+import { fetchDestinationsAndChannels, discoverWorkflows, discoverMutingRules, isSelected } from './utils';
 import {
   StatusRow, ModuleNavBar, AccountConfigGrid, SingleAccountConfig, BundleDropzone,
   BundleSummary, LoadingCard, ErrorCard, WarningList,
@@ -115,7 +115,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
 
     return tree.flatMap(p =>
       (p.conditions || [])
-        .filter(c => ticked[c.id])
+        .filter(c => isSelected(ticked, c.id))
         .map(c => ({ id: c.id, name: `${c.name}  ·  ${p.name}` }))
     );
   })();

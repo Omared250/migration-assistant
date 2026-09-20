@@ -5,7 +5,7 @@
 
 import React, { useRef, useState } from 'react';
 import { describeBundleSource, readBundleFile, validateBundle } from './bundle';
-import { normalizeNewTags } from './utils';
+import { normalizeNewTags, isSelected } from './utils';
 
 /** An empty tag plan. Each module holds its own, so alerts tags never reach dashboards. */
 export const emptyTagPlan = () => ({
@@ -167,7 +167,7 @@ export function resolveTagPlan(plan, items) {
   if (plan.applyToAll) return { newTags: tags, newTagTargets: null };
 
   const targets = {};
-  (items || []).forEach(it => { if (plan.selectedIds[it.id]) targets[it.id] = true; });
+  (items || []).forEach(it => { if (isSelected(plan.selectedIds, it.id)) targets[it.id] = true; });
   return { newTags: tags, newTagTargets: targets };
 }
 

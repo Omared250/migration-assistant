@@ -10,7 +10,7 @@
 // access verified at the moment of migration.
 
 import React, { useState } from 'react';
-import { discoverDashboards } from './utils';
+import { discoverDashboards, isSelected } from './utils';
 import {
   ModuleNavBar, AccountConfigGrid, SingleAccountConfig, BundleDropzone,
   BundleSummary, LoadingCard, ErrorCard, WarningList, SelectableList, StatusRow,
@@ -64,7 +64,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
 
   /** The dashboards this run will create, as the tag picker's item list. */
   const taggableItems = isImport
-    ? (bundle?.payload?.dashboards || []).filter(d => selectedNames[d.name]).map(d => ({ id: d.name, name: d.name }))
+    ? (bundle?.payload?.dashboards || []).filter(d => isSelected(selectedNames, d.name)).map(d => ({ id: d.name, name: d.name }))
     : discovered.filter(d => selectedGuids[d.guid]).map(d => ({ id: d.guid, name: d.name }));
 
   const resetToSetup = () => {
@@ -237,7 +237,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
   };
 
   const handleImport = async () => {
-    const chosen = (bundle.payload.dashboards || []).filter(d => selectedNames[d.name]);
+    const chosen = (bundle.payload.dashboards || []).filter(d => isSelected(selectedNames, d.name));
     if (chosen.length === 0) {
       alert('Select at least one dashboard to import.');
       return;

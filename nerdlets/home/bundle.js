@@ -71,8 +71,11 @@ export function validateBundle(parsed, expectedKind) {
     );
   }
 
-  if (!parsed.payload || typeof parsed.payload !== 'object') {
-    throw new Error('That bundle has no payload.');
+  // Array.isArray guard included deliberately: `typeof [] === 'object'`, so an array payload
+  // would pass and then read as an object with every group missing - an import that silently
+  // does nothing instead of saying the file is wrong.
+  if (!parsed.payload || typeof parsed.payload !== 'object' || Array.isArray(parsed.payload)) {
+    throw new Error('That bundle has no payload, or its payload is not in the expected form.');
   }
 
   return parsed;

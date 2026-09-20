@@ -119,6 +119,8 @@ The workaround — a User API key for the other side — **does not work from a 
 
 So the data moves as a **JSON bundle file** instead. Each pass only ever touches the account you're already signed into, which also means no credentials are involved anywhere.
 
+> **Only import bundles you produced yourself.** A bundle is plain JSON that defines alert conditions, NRQL queries and notification recipients, and importing it creates them in your account using *your* permissions. The import screen lists what will be created — including every email address a notification destination would reach — so review it before confirming. Treat a bundle from someone else the way you'd treat any file you're about to execute.
+
 ---
 
 ## Dashboards

@@ -24,6 +24,7 @@ import {
   fetchSingleConditionDetails,
   fetchUserTagsForEntities,
   resolveTagsForItem,
+  isSelected,
   discoverWorkflows,
   discoverMutingRules,
   discoverNonNrqlConditions,
@@ -101,7 +102,9 @@ export async function gatherAlertsForExport({ client, accountId, inventory, sele
   const log = (stepName, status, detail = '', error = '') => onLog({ stepName, status, detail, error });
 
   const { destinations, channels, policies: allPolicies, workflows: allWorkflows, mutingRules: allRules } = inventory;
-  const picked = (group, id) => !!selections?.[group]?.[id];
+  // Routed through isSelected so an id that collides with an Object.prototype member
+  // ("constructor", "toString") cannot read as ticked when it was not.
+  const picked = (group, id) => isSelected(selections?.[group], id);
 
   // ---- Destinations & channels -------------------------------------------------
   const destById = new Map(destinations.map(d => [String(d.id), d]));

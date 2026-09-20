@@ -11,6 +11,18 @@
 
 import { collectAllPages } from './nerdgraph';
 
+/**
+ * Whether a selection map has an OWN true entry for `key`.
+ *
+ * Selections are plain objects keyed by whatever names the data carries, and a bundle is a file
+ * anyone can edit. A plain `map[key]` walks the prototype chain, so an item named `constructor`
+ * or `toString` reads as selected even when the user never ticked it - which let bundle content
+ * override an explicit selection. Every selection lookup goes through here instead.
+ */
+export function isSelected(map, key) {
+  return !!map && Object.prototype.hasOwnProperty.call(map, key) && !!map[key];
+}
+
 /*************************************************************
  * DASHBOARDS MIGRATION MODULE (PHASE 1) - UNTOUCHED
  *************************************************************/
@@ -832,10 +844,19 @@ export async function fetchUserTagsForEntities(client, guids) {
  * condition, not as a failed condition.
  */
 export async function applyUserTagsToEntity(client, guid, tags) {
+  // Length-capped because tags can arrive from a bundle, which is a file anyone can edit. The
+  // API enforces its own limits; truncating here turns a rejected batch into a written one and
+  // keeps a hand-edited file from pushing a megabyte of tag text through the request.
+  const MAX_TAG_TEXT = 1000;
+
   const clean = (tags || [])
-    .filter(t => t?.key && Array.isArray(t.values) && t.values.length > 0)
+    .filter(t => t && typeof t.key === 'string' && t.key.trim() && Array.isArray(t.values) && t.values.length > 0)
     .filter(t => !RESERVED_TAG_PREFIXES.some(p => t.key.toLowerCase().startsWith(p)))
-    .map(t => ({ key: t.key, values: t.values.map(String) }));
+    .map(t => ({
+      key: t.key.slice(0, MAX_TAG_TEXT),
+      values: t.values.filter(v => v != null).map(v => String(v).slice(0, MAX_TAG_TEXT))
+    }))
+    .filter(t => t.values.length > 0);
 
   if (!guid || clean.length === 0) return 0;
 
@@ -925,8 +946,20 @@ export function normalizeNewTags(rows) {
  */
 export function mergeTagSets(preserved, added) {
   const out = new Map();
-  for (const t of preserved || []) if (t?.key) out.set(t.key, [...(t.values || [])]);
-  for (const t of added || []) if (t?.key) out.set(t.key, [...(t.values || [])]);
+
+  // Array.isArray on both the list and each `values`: `preserved` can come straight out of a
+  // bundle, where a hand-edited "values": "abc" would otherwise spread into three tag values.
+  const take = (list) => {
+    if (!Array.isArray(list)) return;
+    for (const t of list) {
+      if (t && typeof t.key === 'string' && t.key && Array.isArray(t.values)) {
+        out.set(t.key, [...t.values]);
+      }
+    }
+  };
+
+  take(preserved);
+  take(added);
   return [...out.entries()].map(([key, values]) => ({ key, values }));
 }
 
@@ -938,7 +971,7 @@ export function mergeTagSets(preserved, added) {
  * a subset - so an item not in the map gets its preserved tags and nothing else.
  */
 export function resolveTagsForItem({ preserved, newTags, targets, itemId }) {
-  const wanted = !targets || targets[itemId];
+  const wanted = !targets || isSelected(targets, itemId);
   return mergeTagSets(preserved, wanted ? newTags : []);
 }
 
@@ -2088,7 +2121,15 @@ function conditionIdFromEntityGuid(guid) {
  * clean - callers must keep warning the user in that case.
  */
 export async function discoverNonNrqlConditions(client, accountId, knownNrqlConditionIds) {
-  const queryStr = `domain = 'AIOPS' AND type = 'CONDITION' AND accountId = ${parseInt(accountId)}`;
+  // Guarded like the other two entitySearch callers: parseInt already strips anything that is
+  // not a leading number, so this is not injectable either way, but an unchecked NaN would go
+  // out as a broken query instead of a clear message.
+  const numericAccountId = parseInt(accountId, 10);
+  if (!Number.isFinite(numericAccountId)) {
+    return { supported: false, conditions: [] };
+  }
+
+  const queryStr = `domain = 'AIOPS' AND type = 'CONDITION' AND accountId = ${numericAccountId}`;
 
   const query = `
     query ConditionEntities($queryStr: String!, $cursor: String) {

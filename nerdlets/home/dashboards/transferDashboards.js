@@ -19,7 +19,8 @@ import {
   fetchUserTagsForEntities,
   copyUserTagsToEntity,
   resolveTagsForItem,
-  mergeTagSets
+  mergeTagSets,
+  isSelected
 } from '../utils';
 import { sourceGuidsFor } from './runLiveMigration';
 
@@ -100,7 +101,7 @@ export async function gatherDashboardsForExport({ client, selected, newTags = []
 
 export function buildDashboardImportTaskList(payload, selections) {
   return (payload.dashboards || [])
-    .filter(d => selections[d.name])
+    .filter(d => isSelected(selections, d.name))
     .map(d => ({ stepName: d.name, status: 'PENDING', error: '', detail: '' }));
 }
 
@@ -111,7 +112,7 @@ export function buildDashboardImportTaskList(payload, selections) {
 export async function applyDashboardsBundle({
   client, accountId, payload, selections, sourceAccountId, newTags = [], newTagTargets = null, onProgress
 }) {
-  const chosen = (payload.dashboards || []).filter(d => selections[d.name]);
+  const chosen = (payload.dashboards || []).filter(d => isSelected(selections, d.name));
 
   // Checked once, before anything is created. Without the source account ID there is no way to
   // know which account references to replace, and the old code responded by leaving widgets
