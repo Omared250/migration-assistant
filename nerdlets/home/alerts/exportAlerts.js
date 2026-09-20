@@ -20,9 +20,9 @@ import {
   fetchDestinationsAndChannels,
   fetchSingleDestinationDetails,
   fetchSingleChannelDetails,
-  discoverAlertPolicies,
-  fetchPolicyConditionsList,
+  discoverPolicyTree,
   fetchSingleConditionDetails,
+  fetchUserTagsForEntities,
   discoverWorkflows,
   discoverMutingRules,
   discoverNonNrqlConditions,
@@ -37,20 +37,11 @@ import { SOURCE_ACCOUNT_SENTINEL } from '../bundle';
  * Detail fetches (condition definitions, destination and channel properties) then happen only
  * for what the user actually ticked.
  */
-export async function discoverAlertsInventory({ client, accountId }) {
+export async function discoverAlertsInventory({ client, accountId, criteria = { type: 'ALL' } }) {
   const { destinations, channels } = await fetchDestinationsAndChannels(client, accountId);
-  const discoveredPolicies = await discoverAlertPolicies(client, accountId, { type: 'ALL' });
 
-  const policies = [];
-  for (const p of discoveredPolicies) {
-    let conditions = [];
-    try {
-      conditions = await fetchPolicyConditionsList(client, accountId, p.id);
-    } catch (e) {
-      console.warn(`Could not list conditions for policy ${p.name}: ${e.message}`);
-    }
-    policies.push({ ...p, conditions });
-  }
+  const { policies, filtered, matchedConditionIds, unmigratable } =
+    await discoverPolicyTree(client, accountId, criteria);
 
   const workflows = await discoverWorkflows(client, accountId);
 
@@ -62,10 +53,20 @@ export async function discoverAlertsInventory({ client, accountId }) {
     console.warn(`Could not read muting rules: ${e.message}`);
   }
 
-  const allNrqlIds = policies.flatMap(p => (p.conditions || []).map(c => c.id));
-  const nonNrqlReport = await discoverNonNrqlConditions(client, accountId, allNrqlIds);
+  // See the note in runStage1Migration: an account-wide sweep is only meaningful when nothing
+  // was filtered, otherwise it reports everything outside the filter as unmigrated.
+  let nonNrqlReport;
+  if (filtered) {
+    nonNrqlReport = { supported: true, conditions: unmigratable };
+  } else {
+    const allNrqlIds = policies.flatMap(p => (p.conditions || []).map(c => c.id));
+    nonNrqlReport = await discoverNonNrqlConditions(client, accountId, allNrqlIds);
+  }
 
-  return { destinations, channels, policies, workflows, mutingRules, nonNrqlReport };
+  return {
+    destinations, channels, policies, workflows, mutingRules, nonNrqlReport,
+    filtered, matchedConditionIds, unmigratable
+  };
 }
 
 /**
@@ -175,13 +176,22 @@ export async function gatherAlertsForExport({ client, accountId, inventory, sele
     const exportedConditions = [];
     const failures = [];
 
+    // User tags for the whole policy in one request, rather than one per condition. Creating a
+    // condition drops its tags, so they have to travel in the bundle to be restored on import.
+    const tagsByGuid = await fetchUserTagsForEntities(client, conditions.map(c => c.entityGuid));
+
     for (const cond of conditions) {
       try {
         const details = await fetchSingleConditionDetails(client, accountId, cond.id);
+        const userTags = tagsByGuid.get(cond.entityGuid);
+
         // Stored as fetched. The importer feeds this straight into the same
         // createTargetNrqlCondition() the live path uses, so the schema handling
         // (static vs baseline, signal timing, the degraded-retry) is shared.
-        exportedConditions.push(details);
+        //
+        // `userTags` is names and values only - no guid, no id - so it carries nothing
+        // account-scoped across the org boundary.
+        exportedConditions.push(userTags ? { ...details, userTags } : details);
       } catch (e) {
         failures.push(`${cond.name}: ${e.message}`);
       }

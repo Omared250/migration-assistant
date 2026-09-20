@@ -63,6 +63,15 @@ export default function AlertsModule({ client, connection, updateConnection, onE
   const [mappedChannels, setMappedChannels] = useState({});
   const [nonNrqlReport, setNonNrqlReport] = useState(EMPTY_NON_NRQL_REPORT);
 
+  // Discovery filter. ALL is the original behaviour; the other two find CONDITIONS first and
+  // derive their policies. Kept out of resetToSetup so going Back preserves the search, which
+  // is how the dashboards module behaves too.
+  const [filterType, setFilterType] = useState('ALL');
+  const [keyword, setKeyword] = useState('');
+  const [tagKey, setTagKey] = useState('');
+  const [tagValue, setTagValue] = useState('');
+  const [filterNotice, setFilterNotice] = useState('');
+
   const [notifyProgress, setNotifyProgress] = useState([]);
   const [alertProgress, setAlertProgress] = useState([]);
   const [warnings, setWarnings] = useState([]);
@@ -96,7 +105,49 @@ export default function AlertsModule({ client, connection, updateConnection, onE
     setAlertProgress([]);
     setWarnings([]);
     setInventory(null);
+    setFilterNotice('');
     setExportSelections({ destinations: {}, policies: {}, conditions: {}, workflows: {}, mutingRules: {} });
+  };
+
+  const criteria = () => ({ type: filterType, keyword, tagKey, tagValue });
+
+  const validateFilters = () => {
+    if (filterType === 'TAG' && (!tagKey.trim() || !tagValue.trim())) {
+      alert('Validation Error: Both Tag Key and Tag Value are required.');
+      return false;
+    }
+    if (filterType === 'KEYWORD' && !keyword.trim()) {
+      alert('Validation Error: A Keyword is required.');
+      return false;
+    }
+    return true;
+  };
+
+  const describeFilter = () => {
+    if (filterType === 'KEYWORD') return `condition names containing "${keyword.trim()}"`;
+    if (filterType === 'TAG') return `conditions tagged ${tagKey.trim()} = ${tagValue.trim()}`;
+    return '';
+  };
+
+  /**
+   * A filtered run migrates a SUBSET of each matched policy. Saying so matters: the policy is
+   * created (or reused) so the matched conditions have somewhere to live, but its other
+   * conditions are not coming across, and nothing on screen would otherwise reveal that.
+   */
+  const buildFilterNotice = ({ filtered, policies: found, matchedConditionIds, unmigratable }) => {
+    if (!filtered) return '';
+
+    const matched = Object.keys(matchedConditionIds || {}).length;
+    const parts = [
+      `Filtered by ${describeFilter()}: ${matched} condition(s) matched across ${found.length} policy(ies).`,
+      'Only the matching conditions are listed - other conditions in these policies are not included.'
+    ];
+
+    if ((unmigratable || []).length > 0) {
+      parts.push(`${unmigratable.length} matching condition(s) cannot be recreated by this tool and are listed below.`);
+    }
+
+    return parts.join(' ');
   };
 
   const chooseScenario = (choice) => {
@@ -117,6 +168,8 @@ export default function AlertsModule({ client, connection, updateConnection, onE
       alert('Both Source and Target Account IDs are required.');
       return;
     }
+    if (!validateFilters()) return;
+
     setStep(3);
     setErrorMsg('');
 
@@ -167,6 +220,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
         destinations,
         selectedDestinationIds,
         selectedWorkflows: workflows.filter(w => selectedWorkflowIds[w.id]),
+        criteria: criteria(),
         onLog: (entry) => {
           log.push(entry);
           guard(() => setNotifyProgress([...log]));
@@ -181,6 +235,13 @@ export default function AlertsModule({ client, connection, updateConnection, onE
         setSelectedPolicyIds(selectAllById(result.policies));
         setSelectedConditionIds(selectAllById(allConditions));
         setNonNrqlReport(result.nonNrqlReport);
+        setFilterNotice(buildFilterNotice(result));
+
+        // Destinations and channels were already created, so this is not a failed run - the
+        // filter simply matched nothing. Say so instead of showing an empty checklist.
+        if (result.filtered && result.policies.length === 0) {
+          setErrorMsg(`No conditions matched ${describeFilter()} in account ${sourceAccountId}. Stage 1 completed; adjust the filter and re-run Stage 1.`);
+        }
         setStep(2);
       });
     } catch (e) {
@@ -227,15 +288,22 @@ export default function AlertsModule({ client, connection, updateConnection, onE
       alert('An Account ID is required.');
       return;
     }
+    if (!validateFilters()) return;
+
     setStep(3);
     setErrorMsg('');
 
     try {
       await verifySingleAccount(client, sourceAccountId);
-      const inv = await discoverAlertsInventory({ client, accountId: sourceAccountId });
+      const inv = await discoverAlertsInventory({ client, accountId: sourceAccountId, criteria: criteria() });
+
+      if (inv.filtered && inv.policies.length === 0) {
+        throw new Error(`No conditions matched ${describeFilter()} in account ${sourceAccountId}. Nothing was read.`);
+      }
 
       guard(() => {
         setInventory(inv);
+        setFilterNotice(buildFilterNotice(inv));
         setExportSelections({
           destinations: selectAllById(inv.destinations),
           policies: selectAllById(inv.policies),
@@ -345,6 +413,78 @@ export default function AlertsModule({ client, connection, updateConnection, onE
     );
   }
 
+  const filterSection = (
+    <div className="filter-strategy-section">
+      <h4>Discovery Strategy</h4>
+      <div className="radio-group-container">
+        {[
+          ['ALL', 'All Policies & Conditions'],
+          ['KEYWORD', 'Filter by Condition Keyword'],
+          ['TAG', 'Filter by Condition Tag Key/Value']
+        ].map(([value, text]) => (
+          <label className="radio-label" key={value}>
+            <input
+              type="radio"
+              name="alertsFilterType"
+              value={value}
+              checked={filterType === value}
+              onChange={() => { setFilterType(value); setKeyword(''); setTagKey(''); setTagValue(''); }}
+            />
+            {text}
+          </label>
+        ))}
+      </div>
+
+      {filterType !== 'ALL' && (
+        <p className="field-hint">
+          Matches <strong>conditions</strong>, not policy names. The policy each match belongs to is
+          found automatically and comes across with it — carrying only the matching conditions, not
+          the policy's other ones.
+        </p>
+      )}
+
+      {filterType === 'KEYWORD' && (
+        <div className="conditional-input-box">
+          <div className="input-wrapper">
+            <label>Condition name contains</label>
+            <input
+              type="text"
+              className="pure-input"
+              placeholder="e.g. checkout, latency, CPU"
+              value={keyword}
+              onChange={(e) => setKeyword(e.target.value)}
+            />
+          </div>
+        </div>
+      )}
+
+      {filterType === 'TAG' && (
+        <div className="conditional-input-box tag-grid">
+          <div className="input-wrapper">
+            <label>Tag Key</label>
+            <input
+              type="text"
+              className="pure-input"
+              placeholder="e.g. team"
+              value={tagKey}
+              onChange={(e) => setTagKey(e.target.value)}
+            />
+          </div>
+          <div className="input-wrapper">
+            <label>Tag Value</label>
+            <input
+              type="text"
+              className="pure-input"
+              placeholder="e.g. payments"
+              value={tagValue}
+              onChange={(e) => setTagValue(e.target.value)}
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
   return (
     <div className="layout-body-wrapper">
       <ModuleNavBar
@@ -368,6 +508,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
             onSourceChange={(v) => updateConnection({ sourceAccountId: v })}
             onTargetChange={(v) => updateConnection({ targetAccountId: v })}
           />
+          {filterSection}
           <div className="button-group">
             <button onClick={handleLiveDiscover} className="pure-btn primary-btn">Proceed to Stage 1</button>
           </div>
@@ -388,6 +529,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
             accountId={sourceAccountId}
             onChange={(v) => updateConnection({ sourceAccountId: v })}
           />
+          {filterSection}
           <div className="warning-card">
             <h4>ℹ️ What cannot cross an organization boundary</h4>
             <p>
@@ -451,6 +593,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
           selections={exportSelections}
           setSelections={setExportSelections}
           accountId={sourceAccountId}
+          filterNotice={filterNotice}
           onBack={resetToSetup}
           onExport={handleExport}
         />
@@ -466,6 +609,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
           notifyProgress={notifyProgress}
           nonNrqlReport={nonNrqlReport}
           targetAccountId={targetAccountId}
+          filterNotice={filterNotice}
           onBack={() => setStep(1)}
           onMigrate={handleLiveStage2}
         />

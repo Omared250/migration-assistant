@@ -13,8 +13,7 @@ import {
   createTargetDestination,
   fetchSingleChannelDetails,
   createTargetChannel,
-  discoverAlertPolicies,
-  fetchPolicyConditionsList,
+  discoverPolicyTree,
   discoverNonNrqlConditions
 } from '../utils';
 
@@ -27,8 +26,10 @@ import {
  * @param {object[]} args.destinations          all destinations discovered in the source
  * @param {object}   args.selectedDestinationIds  { [id]: boolean }
  * @param {object[]} args.selectedWorkflows     workflows the user ticked in Stage 1
+ * @param {object}   args.criteria              discovery filter: { type: ALL | KEYWORD | TAG, ... }
  * @param {function} args.onLog                 called with each status row as it happens
- * @returns {Promise<{mappedChannels: object, policies: object[], nonNrqlReport: object}>}
+ * @returns {Promise<{mappedChannels: object, policies: object[], nonNrqlReport: object,
+ *                    filtered: boolean, matchedConditionIds: object|null, unmigratable: object[]}>}
  */
 export async function runStage1Migration({
   sourceClient,
@@ -38,6 +39,7 @@ export async function runStage1Migration({
   destinations,
   selectedDestinationIds,
   selectedWorkflows,
+  criteria = { type: 'ALL' },
   onLog
 }) {
   const targetDestMap = {};
@@ -134,24 +136,24 @@ export async function runStage1Migration({
     }
   }
 
-  // 3. Discover policies & conditions for the Stage 2 checklist.
-  const discovered = await discoverAlertPolicies(sourceClient, sourceAccountId, { type: 'ALL' });
-  const policies = [];
-
-  for (const p of discovered) {
-    let conditions = [];
-    try {
-      conditions = await fetchPolicyConditionsList(sourceClient, sourceAccountId, p.id);
-    } catch (e) {
-      console.warn(`Could not list conditions for policy ${p.name}: ${e.message}`);
-    }
-    policies.push({ ...p, conditions });
-  }
+  // 3. Discover policies & conditions for the Stage 2 checklist, honouring the chosen filter.
+  const { policies, filtered, matchedConditionIds, unmigratable } =
+    await discoverPolicyTree(sourceClient, sourceAccountId, criteria);
 
   // Identify conditions this tool cannot migrate, so Stage 2 can say so up front rather
   // than reporting a clean success on a half-copied policy.
-  const allNrqlIds = policies.flatMap(p => (p.conditions || []).map(c => c.id));
-  const nonNrqlReport = await discoverNonNrqlConditions(sourceClient, sourceAccountId, allNrqlIds);
+  //
+  // Only meaningful for an unfiltered run: the account-wide entity sweep would otherwise
+  // report every condition outside the filter as "not migrated", which is true but useless.
+  // A filtered run reports the unsupported conditions the filter actually matched instead.
+  let nonNrqlReport = { supported: true, conditions: [] };
 
-  return { mappedChannels, policies, nonNrqlReport };
+  if (filtered) {
+    nonNrqlReport = { supported: true, conditions: unmigratable };
+  } else {
+    const allNrqlIds = policies.flatMap(p => (p.conditions || []).map(c => c.id));
+    nonNrqlReport = await discoverNonNrqlConditions(sourceClient, sourceAccountId, allNrqlIds);
+  }
+
+  return { mappedChannels, policies, nonNrqlReport, filtered, matchedConditionIds, unmigratable };
 }

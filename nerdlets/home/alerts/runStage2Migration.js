@@ -12,6 +12,8 @@ import {
   fetchExistingConditionNames,
   fetchSingleConditionDetails,
   createTargetNrqlCondition,
+  fetchUserTagsForEntities,
+  copyConditionUserTags,
   createTargetWorkflow,
   createTargetMutingRule
 } from '../utils';
@@ -34,10 +36,16 @@ async function migratePolicy({ policy, sourceClient, targetClient, sourceAccount
   // Read the target policy's existing conditions once, not once per condition.
   const existingNames = await fetchExistingConditionNames(targetClient, targetAccountId, targetPolicy.id);
 
+  // One request for the whole policy's user tags, before anything is created. Creating a
+  // condition drops its tags, so they are re-applied to each new condition below.
+  const sourceTagsByGuid = await fetchUserTagsForEntities(sourceClient, activeConds.map(c => c.entityGuid));
+
   let created = 0;
   let reused = 0;
+  let tagged = 0;
   const failures = [];
   const degraded = [];
+  const tagNotes = [];
 
   for (const cond of activeConds) {
     try {
@@ -48,6 +56,15 @@ async function migratePolicy({ policy, sourceClient, targetClient, sourceAccount
       else created += 1;
       if (result.id) conditionIdMap[cond.id] = result.id;
       if (result.degradedReason) degraded.push(`${cond.name} (${result.degradedReason})`);
+
+      // Only newly created conditions are tagged. A reused one already exists with whatever
+      // tags it has, and its guid is not returned by the name lookup.
+      const userTags = sourceTagsByGuid.get(cond.entityGuid);
+      if (!result.skipped && userTags) {
+        const outcome = await copyConditionUserTags(targetClient, result.entityGuid, userTags);
+        if (outcome?.written) tagged += outcome.written;
+        else if (outcome?.error) tagNotes.push(`${cond.name}: ${outcome.error}`);
+      }
     } catch (e) {
       // One bad condition must not abandon the rest of the policy.
       failures.push(`${cond.name}: ${e.message}`);
@@ -57,6 +74,7 @@ async function migratePolicy({ policy, sourceClient, targetClient, sourceAccount
   const summary = [
     `${created} condition(s) created`,
     reused > 0 ? `${reused} reused` : null,
+    tagged > 0 ? `${tagged} tag(s) copied` : null,
     targetPolicy.skipped ? 'policy reused' : 'policy created'
   ].filter(Boolean).join(', ');
 
@@ -77,6 +95,18 @@ async function migratePolicy({ policy, sourceClient, targetClient, sourceAccount
       patch: {
         status: 'MANUAL',
         error: `${summary}, but advanced settings were reset to defaults for: ${degraded.join('; ')}. Review those conditions in the target account.`
+      }
+    };
+  }
+
+  if (tagNotes.length > 0) {
+    // The conditions are correct; only their tags did not carry over. Worth flagging, because
+    // a tag is often how the user found these conditions in the first place.
+    return {
+      targetPolicy,
+      patch: {
+        status: 'MANUAL',
+        error: `${summary}, but tags could not be copied for: ${tagNotes.join('; ')}. Add them by hand if you filter on them.`
       }
     };
   }

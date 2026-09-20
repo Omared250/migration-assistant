@@ -160,6 +160,22 @@ Older dashboards exist as several sibling entities named `Parent / Page`. These 
 
 Covers: **notification destinations**, **channels**, **alert policies**, **NRQL conditions** (static and baseline), **workflows**, and **muting rules**.
 
+### Choosing what to discover
+
+Live migration and export both offer three strategies:
+
+| Strategy | What it matches |
+|---|---|
+| **All policies & conditions** | Everything in the account |
+| **Condition keyword** | Conditions whose **name** contains your text |
+| **Condition tag** | Conditions carrying a tag key/value you assigned |
+
+The two filters match **conditions**, not policy names. The policy each match belongs to is found automatically and created (or reused) in the target so the conditions have somewhere to live — but it arrives carrying **only the matching conditions**, not the policy's other ones. The selection screen says so explicitly.
+
+A filtered run also reports any matching condition it cannot recreate, rather than quietly listing fewer results than the filter found.
+
+**Condition tags are re-applied after migration.** Creating a condition does not carry its tags over — the API accepts no tag input — so the tool copies the source condition's user tags onto the new one. Without that, a tag-driven migration would produce untagged conditions and the same filter would match nothing in the target. Only your own tags are copied; New Relic's internal metadata tags are left alone. If tagging fails (usually a permissions gap) the condition is still created, and the row is flagged rather than reported as a clean success.
+
 ### Selecting what to move
 
 **Export** shows four tabs — Policies (with per-condition checkboxes), Destinations, Workflows, Muting Rules — with live dependency warnings if you select a workflow without the policies it filters on.
@@ -214,7 +230,7 @@ Multi-location synthetics conditions have a second problem: they reference monit
 
 ### Other alerts limitations
 
-- **Alert policies cannot be filtered by tag** — policies are not taggable entities in New Relic. Use *all* or *keyword*.
+- **Policies themselves cannot be searched by tag.** `policiesSearch` offers no tag criteria, so tag filtering runs against **condition** entities and derives the policies from the matches.
 - **Muting rules targeting specific entities** (`entity.guid`, `targetId`) cannot cross an org boundary — there's no equivalent entity on the other side. They're reported, not silently dropped.
 - **Muting rule schedules without a time zone** are refused; guessing one would shift the window.
 - A condition whose advanced settings are rejected is retried with core fields only, and reported as **needs attention** rather than a clean success, naming what was reset.
@@ -277,5 +293,6 @@ nerdlets/home/
 | Cross-org/region needs two passes | Session is org-scoped; NerdGraph rejects browser API-key calls (CORS) |
 | Only EMAIL / MOBILE_PUSH destinations created | The API never returns credentials for the others |
 | Only NRQL conditions migrated | No API to enumerate other condition types |
-| Policies can't be filtered by tag | Policies aren't taggable entities |
+| Tag filtering matches conditions, not policies | `policiesSearch` has no tag criteria; condition entities do carry tags |
+| A filtered run copies only the matched conditions | Its policy is created so they have a parent, but its other conditions are not included |
 | Synthetics monitors not migrated | Not implemented yet |

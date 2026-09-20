@@ -17,6 +17,7 @@ export default function Stage2Selection({
   notifyProgress,
   nonNrqlReport,
   targetAccountId,
+  filterNotice,
   onBack,
   onMigrate
 }) {
@@ -24,6 +25,13 @@ export default function Stage2Selection({
     <div className="main-card">
       <h3>Stage 2: Select Policies & Alert Conditions to Migrate</h3>
       <p className="card-desc">Review and check exactly which Alert Policies and nested NRQL alert conditions are copied. Baseline conditions are recreated as baseline; static as static.</p>
+
+      {filterNotice && (
+        <div className="warning-card">
+          <h4>ℹ️ This is a filtered subset</h4>
+          <p>{filterNotice}</p>
+        </div>
+      )}
 
       {notifyProgress.length > 0 && (
         <div style={{ marginBottom: '24px' }}>

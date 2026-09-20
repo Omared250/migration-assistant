@@ -17,6 +17,7 @@ import {
   createTargetAlertPolicy,
   createTargetNrqlCondition,
   fetchExistingConditionNames,
+  copyConditionUserTags,
   createTargetWorkflow,
   createTargetMutingRule,
   fetchDestinationsAndChannels
@@ -136,8 +137,10 @@ export async function applyAlertsBundle({ client, accountId, payload, onProgress
       const existingNames = await fetchExistingConditionNames(client, accountId, targetPolicy.id);
       let created = 0;
       let reused = 0;
+      let tagged = 0;
       const failures = [];
       const degraded = [];
+      const tagNotes = [];
 
       for (const cond of policy.conditions || []) {
         try {
@@ -146,6 +149,13 @@ export async function applyAlertsBundle({ client, accountId, payload, onProgress
           else created += 1;
           if (result.id) conditionIdByName.set(cond.name, result.id);
           if (result.degradedReason) degraded.push(`${cond.name} (${result.degradedReason})`);
+
+          // Tags recorded at export, re-applied here. Creating a condition never carries them.
+          if (!result.skipped && cond.userTags?.length > 0) {
+            const outcome = await copyConditionUserTags(client, result.entityGuid, cond.userTags);
+            if (outcome?.written) tagged += outcome.written;
+            else if (outcome?.error) tagNotes.push(`${cond.name}: ${outcome.error}`);
+          }
         } catch (e) {
           failures.push(`${cond.name}: ${e.message}`);
         }
@@ -154,6 +164,7 @@ export async function applyAlertsBundle({ client, accountId, payload, onProgress
       const summary = [
         `${created} condition(s) created`,
         reused > 0 ? `${reused} reused` : null,
+        tagged > 0 ? `${tagged} tag(s) restored` : null,
         targetPolicy.skipped ? 'policy reused' : 'policy created'
       ].filter(Boolean).join(', ');
 
@@ -161,6 +172,8 @@ export async function applyAlertsBundle({ client, accountId, payload, onProgress
         onProgress(idx, { status: 'FAILED', error: `${summary}. ${failures.length} failed - ${failures.join(' | ')}` });
       } else if (degraded.length > 0) {
         onProgress(idx, { status: 'MANUAL', error: `${summary}, but advanced settings were reset to defaults for: ${degraded.join('; ')}. Review those conditions here.` });
+      } else if (tagNotes.length > 0) {
+        onProgress(idx, { status: 'MANUAL', error: `${summary}, but tags could not be restored for: ${tagNotes.join('; ')}. Add them by hand if you filter on them.` });
       } else {
         onProgress(idx, { status: targetPolicy.skipped && created === 0 ? 'SKIPPED' : 'SUCCESS', detail: summary });
       }

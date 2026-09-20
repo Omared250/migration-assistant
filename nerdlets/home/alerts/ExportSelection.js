@@ -31,6 +31,7 @@ export default function ExportSelection({
   selections,
   setSelections,
   accountId,
+  filterNotice,
   onBack,
   onExport
 }) {
@@ -109,6 +110,13 @@ export default function ExportSelection({
         Nothing is modified. Selected: <strong>{totalSelected}</strong> item(s)
         {channelsIncluded > 0 && <> plus <strong>{channelsIncluded}</strong> channel(s) belonging to the selected destinations</>}.
       </p>
+
+      {filterNotice && (
+        <div className="warning-card">
+          <h4>ℹ️ The policy list is a filtered subset</h4>
+          <p>{filterNotice}</p>
+        </div>
+      )}
 
       {(workflowGaps.length > 0 || ruleGaps.length > 0) && (
         <div className="warning-card">

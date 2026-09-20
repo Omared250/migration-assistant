@@ -416,8 +416,11 @@ export function canRecreateDestinationType(type) {
  * Discovers alert policies from the source account (all pages).
  */
 export async function discoverAlertPolicies(client, accountId, criteria) {
+  // Policies are entities and can carry tags, but policiesSearch has no tag criteria and the
+  // entity record exposes no policy fields worth migrating. Tag filtering is done against
+  // CONDITION entities instead - see discoverConditionsByTag.
   if (criteria && criteria.type === 'TAG') {
-    throw new Error("New Relic Alert Policies do not natively support tagging schemas. Please use 'Migrate All' or 'Filter by Keyword' to discover policies.");
+    throw new Error("Alert policies cannot be searched by tag. Filter by condition tag instead, or migrate all policies.");
   }
 
   const query = `
@@ -470,6 +473,7 @@ export async function fetchPolicyConditionsList(client, accountId, policyId) {
                 id
                 name
                 enabled
+                entityGuid
               }
             }
           }
@@ -487,6 +491,390 @@ export async function fetchPolicyConditionsList(client, accountId, policyId) {
     const page = data?.actor?.account?.alerts?.nrqlConditionsSearch;
     return { items: page?.nrqlConditions || [], nextCursor: page?.nextCursor };
   });
+}
+
+/*************************************************************
+ * CONDITION-FIRST DISCOVERY  (keyword / tag)
+ *
+ * The ALL path is policy-first: list policies, then each policy's conditions. The two filters
+ * invert that. They find CONDITIONS first and derive the policies from them, because that is
+ * the actual question - "migrate the conditions matching X, plus the policies they hang off".
+ *
+ *   KEYWORD  alerts API. `nameLike` is a server-side substring filter and `policyId` is
+ *            optional, so one paginated call covers the account. Matches CONDITION names,
+ *            not policy names.
+ *   TAG      entity platform, because tags live on a condition's entity rather than on its
+ *            alerts record. Conditions do accept user tags; everything the platform reports
+ *            as immutable is New Relic's own metadata and is ignored.
+ *
+ * Both return the same shape as fetchPolicyConditionsList so discoverPolicyTree can assemble
+ * an identical tree regardless of how the conditions were found.
+ *************************************************************/
+
+/**
+ * `nr.alerts.type` on a condition entity, mapped to the GraphQL type the create mutations
+ * dispatch on. Anything absent from this map has no create mutation we can route to - it is
+ * reported to the user instead of being attempted and failing later.
+ */
+const CONDITION_TYPENAME_BY_ENTITY_TAG = {
+  'NRQL Query': 'AlertsNrqlStaticCondition',
+  'NRQL Baseline': 'AlertsNrqlBaselineCondition'
+};
+
+/** Conditions whose NAME contains `keyword`, across the whole account. */
+export async function discoverConditionsByKeyword(client, accountId, keyword) {
+  const nameLike = (keyword || '').trim();
+  if (!nameLike) {
+    throw new Error('A keyword is required to search condition names.');
+  }
+
+  const query = `
+    query ConditionsByName($accountId: Int!, $nameLike: String!, $cursor: String) {
+      actor {
+        account(id: $accountId) {
+          alerts {
+            nrqlConditionsSearch(searchCriteria: { nameLike: $nameLike }, cursor: $cursor) {
+              nextCursor
+              nrqlConditions {
+                __typename
+                id
+                name
+                enabled
+                policyId
+                entityGuid
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const conditions = await collectAllPages(async (cursor) => {
+    const data = await client.query(query, { accountId: parseInt(accountId, 10), nameLike, cursor });
+    const page = data?.actor?.account?.alerts?.nrqlConditionsSearch;
+    return { items: page?.nrqlConditions || [], nextCursor: page?.nextCursor };
+  });
+
+  return conditions.map(c => ({ ...c, policyId: c.policyId != null ? String(c.policyId) : null }));
+}
+
+/**
+ * Conditions carrying a user tag, via the entity platform.
+ *
+ * The tag comparison is done here rather than inside the entitySearch expression, for the same
+ * reason discoverDashboards does it: that expression is a query *language*, so a value typed
+ * into a text box could otherwise widen the search instead of narrowing it. Only the account id
+ * reaches the expression, and it is coerced to a number first.
+ *
+ * Every matching condition entity is returned, including kinds this tool cannot recreate. The
+ * caller separates those and reports them - quietly returning only the supported ones would
+ * look like the tag matched less than it did.
+ */
+export async function discoverConditionsByTag(client, accountId, { tagKey, tagValue }) {
+  const wantedKey = (tagKey || '').trim().toLowerCase();
+  const wantedValue = (tagValue || '').trim().toLowerCase();
+  if (!wantedKey || !wantedValue) {
+    throw new Error('Both a tag key and a tag value are required.');
+  }
+
+  const numericAccountId = parseInt(accountId, 10);
+  if (!Number.isFinite(numericAccountId)) {
+    throw new Error(`Account ID must be numeric (got ${JSON.stringify(accountId)}).`);
+  }
+
+  const queryStr = `domain = 'AIOPS' AND type = 'CONDITION' AND accountId = ${numericAccountId}`;
+
+  const query = `
+    query ConditionEntitiesByTag($queryStr: String!, $cursor: String) {
+      actor {
+        entitySearch(query: $queryStr) {
+          results(cursor: $cursor) {
+            nextCursor
+            entities {
+              guid
+              name
+              tags {
+                key
+                values
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const entities = await collectAllPages(async (cursor) => {
+    const data = await client.query(query, { queryStr, cursor }, { tolerateFieldErrors: true });
+    const page = data?.actor?.entitySearch?.results;
+    return { items: page?.entities || [], nextCursor: page?.nextCursor };
+  });
+
+  const matched = entities.filter(e =>
+    (e.tags || []).some(t =>
+      (t.key || '').toLowerCase() === wantedKey &&
+      (t.values || []).some(v => (v || '').toLowerCase() === wantedValue)
+    )
+  );
+
+  return matched.map(e => {
+    const tag = (key) => (e.tags || []).find(t => t.key === key)?.values?.[0] || null;
+    const entityType = tag('nr.alerts.type');
+
+    return {
+      // `nr.alerts.conditionId` is the condition's alerts-API id. The guid encodes it too, so
+      // decoding is kept as a fallback for entities that predate the tag.
+      id: tag('nr.alerts.conditionId') || conditionIdFromEntityGuid(e.guid),
+      name: e.name,
+      policyId: tag('nr.alerts.policyId') || tag('policyId'),
+      entityGuid: e.guid,
+      enabled: tag('nr.alerts.enabled') !== 'false',
+      entityType,
+      __typename: CONDITION_TYPENAME_BY_ENTITY_TAG[entityType] || null
+    };
+  });
+}
+
+/** Resolves a set of policy IDs to their names and incident preference in one call. */
+export async function fetchPoliciesByIds(client, accountId, policyIds) {
+  const ids = [...new Set((policyIds || []).filter(Boolean).map(String))];
+  if (ids.length === 0) return [];
+
+  const query = `
+    query PoliciesByIds($accountId: Int!, $ids: [ID!], $cursor: String) {
+      actor {
+        account(id: $accountId) {
+          alerts {
+            policiesSearch(searchCriteria: { ids: $ids }, cursor: $cursor) {
+              nextCursor
+              policies {
+                id
+                name
+                incidentPreference
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  return collectAllPages(async (cursor) => {
+    const data = await client.query(query, { accountId: parseInt(accountId, 10), ids, cursor });
+    const page = data?.actor?.account?.alerts?.policiesSearch;
+    return { items: page?.policies || [], nextCursor: page?.nextCursor };
+  });
+}
+
+/**
+ * Assembles the { ...policy, conditions: [...] } tree both the live Stage 2 checklist and the
+ * export inventory are built from.
+ *
+ * Returns:
+ *   policies            the tree, containing only conditions that survived the filter
+ *   filtered            false for ALL, so callers can skip filter-specific messaging
+ *   matchedConditionIds { [conditionId]: true } for pre-ticking, null when unfiltered
+ *   unmigratable        matched conditions with no create mutation, for honest reporting
+ */
+export async function discoverPolicyTree(client, accountId, criteria = { type: 'ALL' }) {
+  const type = criteria?.type || 'ALL';
+
+  // ALL is the original policy-first sweep, unchanged.
+  if (type === 'ALL') {
+    const discovered = await discoverAlertPolicies(client, accountId, { type: 'ALL' });
+    const policies = [];
+
+    for (const p of discovered) {
+      let conditions = [];
+      try {
+        conditions = await fetchPolicyConditionsList(client, accountId, p.id);
+      } catch (e) {
+        console.warn(`Could not list conditions for policy ${p.name}: ${e.message}`);
+      }
+      policies.push({ ...p, conditions });
+    }
+
+    return { policies, filtered: false, matchedConditionIds: null, unmigratable: [] };
+  }
+
+  const matches = type === 'TAG'
+    ? await discoverConditionsByTag(client, accountId, criteria)
+    : await discoverConditionsByKeyword(client, accountId, criteria.keyword);
+
+  // The keyword search only ever returns NRQL conditions, so __typename is always set there.
+  // The tag search sees every condition kind, and the unsupported ones are split off here.
+  const migratable = matches.filter(c => c.id && c.__typename);
+  const unmigratable = matches
+    .filter(c => !c.id || !c.__typename)
+    .map(c => ({
+      name: c.name,
+      entityType: c.entityType || 'unknown',
+      guid: c.entityGuid,
+      // Carried through so the report can attribute each one to its policy - NonNrqlWarning
+      // shows the source policy when it knows it, and PolicyTree greys it out in place.
+      conditionId: c.id || null,
+      policyId: c.policyId || null
+    }));
+
+  if (migratable.length === 0) {
+    return { policies: [], filtered: true, matchedConditionIds: {}, unmigratable };
+  }
+
+  const withPolicy = migratable.filter(c => c.policyId);
+  const orphaned = migratable.filter(c => !c.policyId);
+  orphaned.forEach(c => unmigratable.push({
+    name: c.name,
+    entityType: c.entityType || 'unknown',
+    guid: c.entityGuid,
+    conditionId: c.id || null,
+    policyId: null,
+    reason: 'its parent policy could not be determined'
+  }));
+
+  const parents = await fetchPoliciesByIds(client, accountId, withPolicy.map(c => c.policyId));
+  const conditionsByPolicy = new Map();
+  withPolicy.forEach(c => {
+    const key = String(c.policyId);
+    if (!conditionsByPolicy.has(key)) conditionsByPolicy.set(key, []);
+    conditionsByPolicy.get(key).push(c);
+  });
+
+  const policies = parents.map(p => ({
+    ...p,
+    conditions: conditionsByPolicy.get(String(p.id)) || [],
+    // How many conditions the policy actually has, so the UI can say "3 of 11" rather than
+    // letting the user assume the whole policy is coming across.
+    matchedSubset: true
+  }));
+
+  const matchedConditionIds = {};
+  withPolicy.forEach(c => { matchedConditionIds[c.id] = true; });
+
+  return { policies, filtered: true, matchedConditionIds, unmigratable };
+}
+
+/*************************************************************
+ * USER TAGS ON CONDITIONS
+ *
+ * Creating a condition never carries its tags over - the create mutations take no tag input -
+ * so a migrated condition arrives untagged. These two functions read the source condition's
+ * user tags and re-apply them to the new one, which matters especially when a tag is how the
+ * user selected it in the first place.
+ *************************************************************/
+
+/** Tag keys the platform owns. Never copied, and rejected by the tagging API anyway. */
+const RESERVED_TAG_PREFIXES = ['nr.', 'newrelic.'];
+
+/**
+ * User-assigned tags for a set of entities, keyed by guid.
+ *
+ * `tagsWithMetadata` is the only place the platform says whether a tag is the user's or its
+ * own, and it exists on Entity but not on EntityOutline - so this cannot be folded into an
+ * entitySearch. Guids travel as GraphQL variables, one per alias, so batching builds no
+ * strings around values.
+ */
+export async function fetchUserTagsForEntities(client, guids) {
+  const unique = [...new Set((guids || []).filter(Boolean))];
+  const byGuid = new Map();
+  if (unique.length === 0) return byGuid;
+
+  const CHUNK = 25;
+
+  for (let start = 0; start < unique.length; start += CHUNK) {
+    const chunk = unique.slice(start, start + CHUNK);
+    const params = chunk.map((_, i) => `$g${i}: EntityGuid!`).join(', ');
+    const selections = chunk
+      .map((_, i) => `e${i}: entity(guid: $g${i}) { guid tagsWithMetadata { key values { value mutable } } }`)
+      .join('\n          ');
+
+    const query = `
+      query EntityUserTags(${params}) {
+        actor {
+          ${selections}
+        }
+      }
+    `;
+
+    const variables = {};
+    chunk.forEach((guid, i) => { variables[`g${i}`] = guid; });
+
+    let data;
+    try {
+      data = await client.query(query, variables, { tolerateFieldErrors: true });
+    } catch (e) {
+      // Tags are an enhancement, never a reason to abandon a migration.
+      console.warn(`Could not read user tags for ${chunk.length} condition(s): ${e.message}`);
+      continue;
+    }
+
+    Object.values(data?.actor || {}).forEach(entity => {
+      if (!entity?.guid) return;
+
+      const userTags = (entity.tagsWithMetadata || [])
+        .filter(t => !RESERVED_TAG_PREFIXES.some(p => (t.key || '').toLowerCase().startsWith(p)))
+        .map(t => ({
+          key: t.key,
+          values: (t.values || []).filter(v => v.mutable).map(v => v.value)
+        }))
+        .filter(t => t.values.length > 0);
+
+      if (userTags.length > 0) byGuid.set(entity.guid, userTags);
+    });
+  }
+
+  return byGuid;
+}
+
+/**
+ * Applies tags to an entity. Resolves with the number of tags written, or throws with the
+ * API's own message - callers treat a failure here as a note on an otherwise created
+ * condition, not as a failed condition.
+ */
+export async function applyUserTagsToEntity(client, guid, tags) {
+  const clean = (tags || [])
+    .filter(t => t?.key && Array.isArray(t.values) && t.values.length > 0)
+    .filter(t => !RESERVED_TAG_PREFIXES.some(p => t.key.toLowerCase().startsWith(p)))
+    .map(t => ({ key: t.key, values: t.values.map(String) }));
+
+  if (!guid || clean.length === 0) return 0;
+
+  const mutation = `
+    mutation AddEntityTags($guid: EntityGuid!, $tags: [TaggingTagInput!]!) {
+      taggingAddTagsToEntity(guid: $guid, tags: $tags) {
+        errors {
+          message
+          type
+        }
+      }
+    }
+  `;
+
+  const data = await client.mutate(mutation, { guid, tags: clean }, 'apply condition tags');
+  const errors = data?.taggingAddTagsToEntity?.errors || [];
+
+  if (errors.length > 0) {
+    throw new Error(errors.map(e => [e.type, e.message].filter(Boolean).join(': ')).join(' | '));
+  }
+
+  return clean.length;
+}
+
+/**
+ * Copies a source condition's user tags onto the condition just created from it.
+ *
+ * Never throws: a tag that would not apply is reported back as a note so the caller can
+ * surface it without downgrading a condition that was created correctly.
+ */
+export async function copyConditionUserTags(client, targetEntityGuid, userTags) {
+  if (!targetEntityGuid || !userTags || userTags.length === 0) return null;
+
+  try {
+    const written = await applyUserTagsToEntity(client, targetEntityGuid, userTags);
+    return written > 0 ? { written } : null;
+  } catch (e) {
+    return { error: e.message };
+  }
 }
 
 /**
@@ -788,11 +1176,15 @@ function buildTermsInput(terms, { baseline = false } = {}) {
   return cleaned;
 }
 
+// `entityGuid` is selected so user tags can be re-applied to the new condition straight away.
+// Creating a condition does not carry its tags over, and the guid is the only handle the
+// tagging API accepts - fetching it afterwards would be a second round trip per condition.
 const STATIC_CONDITION_MUTATION = `
   mutation CreateStaticCondition($accountId: Int!, $policyId: ID!, $condition: AlertsNrqlConditionStaticInput!) {
     alertsNrqlConditionStaticCreate(accountId: $accountId, policyId: $policyId, condition: $condition) {
       id
       name
+      entityGuid
     }
   }
 `;
@@ -802,6 +1194,7 @@ const BASELINE_CONDITION_MUTATION = `
     alertsNrqlConditionBaselineCreate(accountId: $accountId, policyId: $policyId, condition: $condition) {
       id
       name
+      entityGuid
     }
   }
 `;
