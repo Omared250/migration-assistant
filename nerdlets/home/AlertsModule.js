@@ -15,7 +15,8 @@ import React, { useState } from 'react';
 import { fetchDestinationsAndChannels, discoverWorkflows, discoverMutingRules } from './utils';
 import {
   StatusRow, ModuleNavBar, AccountConfigGrid, SingleAccountConfig, BundleDropzone,
-  BundleSummary, LoadingCard, ErrorCard, WarningList
+  BundleSummary, LoadingCard, ErrorCard, WarningList,
+  TagAssignment, emptyTagPlan, resolveTagPlan
 } from './components';
 import { useMountedGuard } from './hooks';
 import { verifyMigrationAccess, verifySingleAccount } from './access';
@@ -84,8 +85,40 @@ export default function AlertsModule({ client, connection, updateConnection, onE
     destinations: {}, policies: {}, conditions: {}, workflows: {}, mutingRules: {}
   });
 
+  // New tags the user is adding in this run. Owned by this module, so nothing entered here can
+  // reach the dashboards migration. Tags a condition already had are copied unconditionally.
+  const [tagPlan, setTagPlan] = useState(emptyTagPlan());
+
   const { sourceAccountId, targetAccountId } = connection;
   const isImport = scenario === SCENARIO.IMPORT;
+
+  /**
+   * The conditions this run will create, as the tag picker's item list.
+   *
+   * Conditions are the only alerts resource that can carry a tag: policies are entities but
+   * expose nothing worth tagging here, and channels and muting rules are not entities at all,
+   * so there is no guid for the tagging API to address.
+   *
+   * Identified by id while both accounts are reachable, and by name once a bundle is involved -
+   * a bundle has no IDs by design.
+   */
+  const taggableItems = (() => {
+    if (isImport) {
+      return (bundle?.payload?.policies || []).flatMap(p =>
+        (p.conditions || []).map(c => ({ id: c.name, name: `${c.name}  ·  ${p.name}` }))
+      );
+    }
+
+    const isExport = scenario === SCENARIO.EXPORT;
+    const tree = (isExport ? inventory?.policies : policies) || [];
+    const ticked = isExport ? exportSelections.conditions : selectedConditionIds;
+
+    return tree.flatMap(p =>
+      (p.conditions || [])
+        .filter(c => ticked[c.id])
+        .map(c => ({ id: c.id, name: `${c.name}  ·  ${p.name}` }))
+    );
+  })();
 
   const resetToSetup = () => {
     setStep(0);
@@ -154,6 +187,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
     setScenario(choice);
     resetToSetup();
     setBundle(null);
+    setTagPlan(emptyTagPlan());
   };
 
   const updateAlertLog = (idx, patch) => {
@@ -273,6 +307,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
       workflows: chosenWorkflows,
       mutingRules: chosenRules,
       mappedChannels,
+      ...resolveTagPlan(tagPlan, taggableItems),
       onProgress: updateAlertLog
     });
 
@@ -335,6 +370,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
         accountId: sourceAccountId,
         inventory,
         selections: exportSelections,
+        ...resolveTagPlan(tagPlan, taggableItems),
         onLog: (row) => {
           log.push(row);
           guard(() => setAlertProgress([...log]));
@@ -392,6 +428,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
         client,
         accountId: targetAccountId,
         payload: bundle.payload,
+        ...resolveTagPlan(tagPlan, taggableItems),
         onProgress: updateAlertLog
       });
 
@@ -564,6 +601,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
             onClear={() => setBundle(null)}
           />
           {bundle && <BundleSummary bundle={bundle} />}
+          {bundle && <TagAssignment noun="conditions" items={taggableItems} plan={tagPlan} setPlan={setTagPlan} />}
           <div className="button-group">
             <button onClick={handleImport} className="pure-btn primary-btn" disabled={!bundle}>Create Everything in This Bundle</button>
           </div>
@@ -594,6 +632,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
           setSelections={setExportSelections}
           accountId={sourceAccountId}
           filterNotice={filterNotice}
+          tagSection={<TagAssignment noun="conditions" items={taggableItems} plan={tagPlan} setPlan={setTagPlan} />}
           onBack={resetToSetup}
           onExport={handleExport}
         />
@@ -610,6 +649,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
           nonNrqlReport={nonNrqlReport}
           targetAccountId={targetAccountId}
           filterNotice={filterNotice}
+          tagSection={<TagAssignment noun="conditions" items={taggableItems} plan={tagPlan} setPlan={setTagPlan} />}
           onBack={() => setStep(1)}
           onMigrate={handleLiveStage2}
         />

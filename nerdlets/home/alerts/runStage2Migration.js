@@ -13,7 +13,8 @@ import {
   fetchSingleConditionDetails,
   createTargetNrqlCondition,
   fetchUserTagsForEntities,
-  copyConditionUserTags,
+  copyUserTagsToEntity,
+  resolveTagsForItem,
   createTargetWorkflow,
   createTargetMutingRule
 } from '../utils';
@@ -29,7 +30,7 @@ export function buildStage2TaskList({ policies, workflows, mutingRules }) {
   ];
 }
 
-async function migratePolicy({ policy, sourceClient, targetClient, sourceAccountId, targetAccountId, selectedConditionIds, conditionIdMap }) {
+async function migratePolicy({ policy, sourceClient, targetClient, sourceAccountId, targetAccountId, selectedConditionIds, conditionIdMap, newTags, newTagTargets }) {
   const targetPolicy = await createTargetAlertPolicy(targetClient, targetAccountId, policy.name, policy.incidentPreference);
 
   const activeConds = (policy.conditions || []).filter(c => selectedConditionIds[c.id]);
@@ -59,9 +60,18 @@ async function migratePolicy({ policy, sourceClient, targetClient, sourceAccount
 
       // Only newly created conditions are tagged. A reused one already exists with whatever
       // tags it has, and its guid is not returned by the name lookup.
-      const userTags = sourceTagsByGuid.get(cond.entityGuid);
-      if (!result.skipped && userTags) {
-        const outcome = await copyConditionUserTags(targetClient, result.entityGuid, userTags);
+      //
+      // One call carrying both the tags the source condition had and any the user is adding in
+      // this run - two calls would leave a window where the condition is half-tagged.
+      const tags = resolveTagsForItem({
+        preserved: sourceTagsByGuid.get(cond.entityGuid),
+        newTags,
+        targets: newTagTargets,
+        itemId: cond.id
+      });
+
+      if (!result.skipped && tags.length > 0) {
+        const outcome = await copyUserTagsToEntity(targetClient, result.entityGuid, tags);
         if (outcome?.written) tagged += outcome.written;
         else if (outcome?.error) tagNotes.push(`${cond.name}: ${outcome.error}`);
       }
@@ -164,7 +174,9 @@ async function migrateWorkflow({ workflow, targetClient, targetAccountId, policy
 }
 
 /**
- * @param {function} args.onProgress  (index, patch) => void, index matching buildStage2TaskList
+ * @param {object[]} args.newTags        [{ key, values }] the user is adding in this run, or []
+ * @param {object}   args.newTagTargets  { [conditionId]: true }, or null for every condition
+ * @param {function} args.onProgress     (index, patch) => void, index matching buildStage2TaskList
  */
 export async function runStage2Migration({
   sourceClient,
@@ -176,6 +188,8 @@ export async function runStage2Migration({
   workflows,
   mutingRules,
   mappedChannels,
+  newTags = [],
+  newTagTargets = null,
   onProgress
 }) {
   const policyIdMap = {};
@@ -196,7 +210,9 @@ export async function runStage2Migration({
         sourceAccountId,
         targetAccountId,
         selectedConditionIds,
-        conditionIdMap
+        conditionIdMap,
+        newTags,
+        newTagTargets
       });
       policyIdMap[policy.id] = targetPolicy.id;
       onProgress(i, patch);

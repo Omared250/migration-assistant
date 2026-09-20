@@ -18,6 +18,7 @@ export default function Stage2Selection({
   nonNrqlReport,
   targetAccountId,
   filterNotice,
+  tagSection,
   onBack,
   onMigrate
 }) {
@@ -52,6 +53,8 @@ export default function Stage2Selection({
         setSelectedConditionIds={setSelectedConditionIds}
         nonNrqlReport={nonNrqlReport}
       />
+
+      {tagSection}
 
       <div className="button-group">
         <button onClick={onBack} className="pure-btn plain-btn">Back to Stage 1</button>

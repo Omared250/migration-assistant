@@ -17,7 +17,8 @@ import {
   createTargetAlertPolicy,
   createTargetNrqlCondition,
   fetchExistingConditionNames,
-  copyConditionUserTags,
+  copyUserTagsToEntity,
+  resolveTagsForItem,
   createTargetWorkflow,
   createTargetMutingRule,
   fetchDestinationsAndChannels
@@ -49,9 +50,11 @@ export function buildImportTaskList(payload) {
  * @param {object}   args.client      session client for the target account
  * @param {string}   args.accountId   target account
  * @param {object}   args.payload     bundle payload - applied in full
+ * @param {object[]} args.newTags     [{ key, values }] the importer is adding, or []
+ * @param {object}   args.newTagTargets { [conditionName]: true }, or null for every condition
  * @param {function} args.onProgress  (index, patch) => void, indexes matching buildImportTaskList
  */
-export async function applyAlertsBundle({ client, accountId, payload, onProgress }) {
+export async function applyAlertsBundle({ client, accountId, payload, newTags = [], newTagTargets = null, onProgress }) {
   const chosenDestinations = payload.destinations || [];
   const chosenChannels = payload.channels || [];
   const chosenPolicies = payload.policies || [];
@@ -150,9 +153,19 @@ export async function applyAlertsBundle({ client, accountId, payload, onProgress
           if (result.id) conditionIdByName.set(cond.name, result.id);
           if (result.degradedReason) degraded.push(`${cond.name} (${result.degradedReason})`);
 
-          // Tags recorded at export, re-applied here. Creating a condition never carries them.
-          if (!result.skipped && cond.userTags?.length > 0) {
-            const outcome = await copyConditionUserTags(client, result.entityGuid, cond.userTags);
+          // Tags recorded at export (preserved plus anything chosen there), merged with tags
+          // the importer is adding now. Creating a condition never carries tags over.
+          //
+          // Per-item targeting here is keyed by NAME - the only identifier a bundle has.
+          const tags = resolveTagsForItem({
+            preserved: cond.userTags,
+            newTags,
+            targets: newTagTargets,
+            itemId: cond.name
+          });
+
+          if (!result.skipped && tags.length > 0) {
+            const outcome = await copyUserTagsToEntity(client, result.entityGuid, tags);
             if (outcome?.written) tagged += outcome.written;
             else if (outcome?.error) tagNotes.push(`${cond.name}: ${outcome.error}`);
           }

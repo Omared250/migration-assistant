@@ -32,6 +32,7 @@ export default function ExportSelection({
   setSelections,
   accountId,
   filterNotice,
+  tagSection,
   onBack,
   onExport
 }) {
@@ -229,6 +230,8 @@ export default function ExportSelection({
           />
         </div>
       )}
+
+      {tagSection}
 
       <div className="button-group">
         <button onClick={onBack} className="pure-btn plain-btn">Back</button>

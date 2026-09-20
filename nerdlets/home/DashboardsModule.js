@@ -13,7 +13,8 @@ import React, { useState } from 'react';
 import { discoverDashboards } from './utils';
 import {
   ModuleNavBar, AccountConfigGrid, SingleAccountConfig, BundleDropzone,
-  BundleSummary, LoadingCard, ErrorCard, WarningList, SelectableList, StatusRow
+  BundleSummary, LoadingCard, ErrorCard, WarningList, SelectableList, StatusRow,
+  TagAssignment, emptyTagPlan, resolveTagPlan
 } from './components';
 import { useMountedGuard } from './hooks';
 import { verifyMigrationAccess, verifySingleAccount } from './access';
@@ -53,8 +54,18 @@ export default function DashboardsModule({ client, connection, updateConnection,
   const [bundle, setBundle] = useState(null);
   const [selectedNames, setSelectedNames] = useState({});
 
+  // New tags the user is adding in this run. Owned by this module, so nothing entered here can
+  // reach the alerts migration. Tags a dashboard already had are copied unconditionally and are
+  // not part of this.
+  const [tagPlan, setTagPlan] = useState(emptyTagPlan());
+
   const { sourceAccountId, targetAccountId } = connection;
   const isImport = scenario === SCENARIO.IMPORT;
+
+  /** The dashboards this run will create, as the tag picker's item list. */
+  const taggableItems = isImport
+    ? (bundle?.payload?.dashboards || []).filter(d => selectedNames[d.name]).map(d => ({ id: d.name, name: d.name }))
+    : discovered.filter(d => selectedGuids[d.guid]).map(d => ({ id: d.guid, name: d.name }));
 
   const resetToSetup = () => {
     setStep(0);
@@ -70,6 +81,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
     setScenario(choice);
     resetToSetup();
     setBundle(null);
+    setTagPlan(emptyTagPlan());
   };
 
   const updateProgress = (i, patch) => {
@@ -138,7 +150,9 @@ export default function DashboardsModule({ client, connection, updateConnection,
     setProgress(selected.map(d => ({ stepName: d.name, status: 'PENDING', error: '', detail: '' })));
 
     await runLiveDashboardMigration({
-      client, sourceAccountId, targetAccountId, selected, onProgress: updateProgress
+      client, sourceAccountId, targetAccountId, selected,
+      ...resolveTagPlan(tagPlan, taggableItems),
+      onProgress: updateProgress
     });
 
     guard(() => setStep(3));
@@ -161,6 +175,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
       const { payload, warnings: notes } = await gatherDashboardsForExport({
         client,
         selected,
+        ...resolveTagPlan(tagPlan, taggableItems),
         onLog: (row) => {
           log.push(row);
           guard(() => setProgress([...log]));
@@ -238,6 +253,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
       payload: bundle.payload,
       selections: selectedNames,
       sourceAccountId: bundle.source?.accountId,
+      ...resolveTagPlan(tagPlan, taggableItems),
       onProgress: updateProgress
     });
 
@@ -398,6 +414,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
               </>
             )}
           />
+          <TagAssignment noun="dashboards" items={taggableItems} plan={tagPlan} setPlan={setTagPlan} />
           <div className="button-group">
             <button onClick={resetToSetup} className="pure-btn plain-btn">Back</button>
             <button onClick={scenario === SCENARIO.LIVE ? handleLiveMigrate : handleExport} className="pure-btn primary-btn">
@@ -427,6 +444,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
               </>
             )}
           />
+          <TagAssignment noun="dashboards" items={taggableItems} plan={tagPlan} setPlan={setTagPlan} />
           <div className="button-group">
             <button onClick={resetToSetup} className="pure-btn plain-btn">Back</button>
             <button onClick={handleImport} className="pure-btn primary-btn">Create Selected Dashboards</button>

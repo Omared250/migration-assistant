@@ -861,12 +861,12 @@ export async function applyUserTagsToEntity(client, guid, tags) {
 }
 
 /**
- * Copies a source condition's user tags onto the condition just created from it.
+ * Copies user tags onto an entity just created from another one - a condition or a dashboard.
  *
  * Never throws: a tag that would not apply is reported back as a note so the caller can
- * surface it without downgrading a condition that was created correctly.
+ * surface it without downgrading an item that was created correctly.
  */
-export async function copyConditionUserTags(client, targetEntityGuid, userTags) {
+export async function copyUserTagsToEntity(client, targetEntityGuid, userTags) {
   if (!targetEntityGuid || !userTags || userTags.length === 0) return null;
 
   try {
@@ -875,6 +875,71 @@ export async function copyConditionUserTags(client, targetEntityGuid, userTags) 
   } catch (e) {
     return { error: e.message };
   }
+}
+
+/**
+ * Turns the UI's tag rows - [{ key, value }] straight off the inputs - into the
+ * [{ key, values }] shape the tagging API takes.
+ *
+ * Blank rows are dropped rather than rejected, because an empty trailing row is how the editor
+ * lets you add one. Duplicate keys merge instead of overwriting, so entering env=prod and
+ * env=canary produces one key with both values, matching what the API would do anyway.
+ *
+ * Returns { tags, rejected } - `rejected` names anything dropped for being reserved, so the
+ * user is told rather than silently ignored.
+ */
+export function normalizeNewTags(rows) {
+  const byKey = new Map();
+  const rejected = [];
+
+  for (const row of rows || []) {
+    const key = (row?.key || '').trim();
+    const value = (row?.value || '').trim();
+    if (!key && !value) continue;
+
+    if (!key || !value) {
+      rejected.push(`"${key || value}" needs both a key and a value`);
+      continue;
+    }
+    if (RESERVED_TAG_PREFIXES.some(p => key.toLowerCase().startsWith(p))) {
+      rejected.push(`"${key}" uses a reserved prefix New Relic owns`);
+      continue;
+    }
+
+    if (!byKey.has(key)) byKey.set(key, new Set());
+    byKey.get(key).add(value);
+  }
+
+  return {
+    tags: [...byKey.entries()].map(([key, values]) => ({ key, values: [...values] })),
+    rejected
+  };
+}
+
+/**
+ * Merges tags copied from the source with tags the user is adding in this run.
+ *
+ * Added tags win on a key collision. The alternative - letting the API accumulate both - would
+ * leave a condition tagged env=staging AND env=prod, which reads as a migration bug rather
+ * than a choice.
+ */
+export function mergeTagSets(preserved, added) {
+  const out = new Map();
+  for (const t of preserved || []) if (t?.key) out.set(t.key, [...(t.values || [])]);
+  for (const t of added || []) if (t?.key) out.set(t.key, [...(t.values || [])]);
+  return [...out.entries()].map(([key, values]) => ({ key, values }));
+}
+
+/**
+ * The tags a single migrated item should end up with: what it carried in the source, plus
+ * whatever the user is adding to it in this run.
+ *
+ * `targets` is null when the user chose "every item", or a { [id]: true } map when they picked
+ * a subset - so an item not in the map gets its preserved tags and nothing else.
+ */
+export function resolveTagsForItem({ preserved, newTags, targets, itemId }) {
+  const wanted = !targets || targets[itemId];
+  return mergeTagSets(preserved, wanted ? newTags : []);
 }
 
 /**

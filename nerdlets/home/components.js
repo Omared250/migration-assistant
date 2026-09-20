@@ -5,6 +5,171 @@
 
 import React, { useRef, useState } from 'react';
 import { describeBundleSource, readBundleFile, validateBundle } from './bundle';
+import { normalizeNewTags } from './utils';
+
+/** An empty tag plan. Each module holds its own, so alerts tags never reach dashboards. */
+export const emptyTagPlan = () => ({
+  enabled: false,
+  rows: [{ key: '', value: '' }],
+  applyToAll: true,
+  selectedIds: {}
+});
+
+/**
+ * "Do you want to add new tags?" and, if so, which tags on which items.
+ *
+ * Deliberately gated behind an explicit no/yes rather than an always-visible editor: the
+ * default has to be the flow that existed before, so a user who does not care about tags sees
+ * one extra question and nothing else.
+ *
+ * This is ONLY about new tags the user is inventing now. Tags an item already carried in the
+ * source are copied unconditionally by the migration itself and are not represented here.
+ *
+ * @param {string}   props.noun      what is being tagged, for the copy ("dashboards")
+ * @param {object[]} props.items     [{ id, name }] the items this run will create
+ * @param {object}   props.plan      { enabled, rows, applyToAll, selectedIds }
+ */
+export function TagAssignment({ noun, items = [], plan, setPlan }) {
+  const { enabled, rows, applyToAll, selectedIds } = plan;
+  const { tags, rejected } = normalizeNewTags(rows);
+
+  const patch = (changes) => setPlan({ ...plan, ...changes });
+  const setRow = (i, field, value) =>
+    patch({ rows: rows.map((r, idx) => (idx === i ? { ...r, [field]: value } : r)) });
+
+  const targetCount = applyToAll ? items.length : items.filter(it => selectedIds[it.id]).length;
+
+  return (
+    <div className="filter-strategy-section">
+      <h4>Add new tags to the migrated {noun}?</h4>
+      <p className="field-hint">
+        Tags the {noun} already have in the source account are always copied across — this is for
+        tags you want to add, such as <code>migrated_from</code> or an owning team.
+      </p>
+
+      <div className="radio-group-container">
+        {[[false, 'No, migrate without adding tags'], [true, 'Yes, add tags']].map(([value, text]) => (
+          <label className="radio-label" key={String(value)}>
+            <input
+              type="radio"
+              name={`addTags-${noun}`}
+              checked={enabled === value}
+              onChange={() => patch({ enabled: value })}
+            />
+            {text}
+          </label>
+        ))}
+      </div>
+
+      {enabled && (
+        <div className="conditional-input-box">
+          {rows.map((row, i) => (
+            <div key={i} className="tag-grid" style={{ marginBottom: '8px' }}>
+              <div className="input-wrapper">
+                <label>Tag Key</label>
+                <input
+                  type="text"
+                  className="pure-input"
+                  placeholder="e.g. migrated_from"
+                  value={row.key}
+                  onChange={(e) => setRow(i, 'key', e.target.value)}
+                />
+              </div>
+              <div className="input-wrapper">
+                <label>Tag Value</label>
+                <input
+                  type="text"
+                  className="pure-input"
+                  placeholder="e.g. 1234567"
+                  value={row.value}
+                  onChange={(e) => setRow(i, 'value', e.target.value)}
+                />
+              </div>
+            </div>
+          ))}
+
+          <div className="button-group" style={{ marginTop: 0 }}>
+            <button
+              className="pure-btn plain-btn small-btn"
+              onClick={() => patch({ rows: [...rows, { key: '', value: '' }] })}
+            >
+              + Add another tag
+            </button>
+            {rows.length > 1 && (
+              <button
+                className="pure-btn plain-btn small-btn"
+                onClick={() => patch({ rows: rows.slice(0, -1) })}
+              >
+                Remove last
+              </button>
+            )}
+          </div>
+
+          {rejected.length > 0 && (
+            <div className="error-card" style={{ marginTop: '12px', marginBottom: 0 }}>
+              <h4>⚠️ These will not be applied</h4>
+              <ul className="warning-list">{rejected.map((r, i) => <li key={i}>{r}</li>)}</ul>
+            </div>
+          )}
+
+          <h4 style={{ margin: '20px 0 8px 0', fontSize: '14px' }}>Apply them to</h4>
+          <div className="radio-group-container">
+            {[[true, `All ${items.length} migrated ${noun}`], [false, `Only ${noun} I pick`]].map(([value, text]) => (
+              <label className="radio-label" key={String(value)}>
+                <input
+                  type="radio"
+                  name={`tagScope-${noun}`}
+                  checked={applyToAll === value}
+                  onChange={() => patch({ applyToAll: value })}
+                />
+                {text}
+              </label>
+            ))}
+          </div>
+
+          {!applyToAll && (
+            <SelectableList
+              items={items}
+              idOf={(it) => it.id}
+              selectedIds={selectedIds}
+              onToggle={(id) => patch({ selectedIds: { ...selectedIds, [id]: !selectedIds[id] } })}
+              onToggleAll={(all) => {
+                const updated = {};
+                items.forEach(it => { updated[it.id] = all; });
+                patch({ selectedIds: updated });
+              }}
+              emptyMessage={`No ${noun} to tag.`}
+              renderItem={(it) => <strong>{it.name}</strong>}
+            />
+          )}
+
+          <p className="field-hint">
+            {tags.length === 0
+              ? 'No complete tag entered yet — nothing will be applied.'
+              : `${tags.length} tag(s) will be applied to ${targetCount} of ${items.length} ${noun}.`}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Turns a tag plan into the two arguments every migration function takes.
+ * `targets: null` means "every item", which keeps the common case free of a lookup.
+ */
+export function resolveTagPlan(plan, items) {
+  if (!plan?.enabled) return { newTags: [], newTagTargets: null };
+
+  const { tags } = normalizeNewTags(plan.rows);
+  if (tags.length === 0) return { newTags: [], newTagTargets: null };
+
+  if (plan.applyToAll) return { newTags: tags, newTagTargets: null };
+
+  const targets = {};
+  (items || []).forEach(it => { if (plan.selectedIds[it.id]) targets[it.id] = true; });
+  return { newTags: tags, newTagTargets: targets };
+}
 
 /** Renders one status row in a migration log. */
 export function StatusRow({ item }) {

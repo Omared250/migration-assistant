@@ -15,22 +15,41 @@ import {
   createTargetDashboard,
   mapEntityToDashboardInput,
   mapPageToDashboardPageInput,
-  mapVariables
+  mapVariables,
+  fetchUserTagsForEntities,
+  copyUserTagsToEntity,
+  resolveTagsForItem,
+  mergeTagSets
 } from '../utils';
+import { sourceGuidsFor } from './runLiveMigration';
 
 /**
  * Reads full definitions for the selected dashboards, consolidating legacy tab groups the
  * same way the live path does.
  *
+ * @param {object[]} args.newTags       [{ key, values }] the user is adding, or []
+ * @param {object}   args.newTagTargets { [dashboardGuid]: true }, or null for every dashboard
  * @returns {Promise<{payload: object, warnings: string[]}>}
  */
-export async function gatherDashboardsForExport({ client, selected, onLog }) {
+export async function gatherDashboardsForExport({ client, selected, newTags = [], newTagTargets = null, onLog }) {
   const dashboards = [];
   const warnings = [];
+
+  // Dashboard tags do not survive a create, so they travel in the bundle and are re-applied at
+  // import. The per-item choice is resolved here, while guids still mean something - by import
+  // time the only identifier left is the name.
+  const tagsByGuid = await fetchUserTagsForEntities(client, selected.flatMap(sourceGuidsFor));
+  const tagsFor = (parent) => resolveTagsForItem({
+    preserved: sourceGuidsFor(parent).reduce((acc, g) => mergeTagSets(acc, tagsByGuid.get(g) || []), []),
+    newTags,
+    targets: newTagTargets,
+    itemId: parent.guid
+  });
 
   for (const parent of selected) {
     try {
       const details = await fetchSourceDashboard(client, parent.guid);
+      const userTags = tagsFor(parent);
 
       // Legacy tabbed dashboards arrive as several sibling entities named "Parent / Page".
       // Consolidate them here so the bundle holds one dashboard, not one per tab.
@@ -55,7 +74,8 @@ export async function gatherDashboardsForExport({ client, selected, onLog }) {
           permissions: details.permissions || 'PUBLIC_READ_WRITE',
           pages,
           variables: details.variables || [],
-          consolidatedFrom: parent.pagesToMigrate.length
+          consolidatedFrom: parent.pagesToMigrate.length,
+          ...(userTags.length > 0 ? { userTags } : {})
         });
         onLog({ stepName: parent.name, status: 'SUCCESS', detail: `Exported (${pages.length} pages consolidated from a legacy tab group)`, error: '' });
         continue;
@@ -65,7 +85,8 @@ export async function gatherDashboardsForExport({ client, selected, onLog }) {
         name: details.name,
         permissions: details.permissions || 'PUBLIC_READ_WRITE',
         pages: details.pages || [],
-        variables: details.variables || []
+        variables: details.variables || [],
+        ...(userTags.length > 0 ? { userTags } : {})
       });
       onLog({ stepName: parent.name, status: 'SUCCESS', detail: `Exported (${(details.pages || []).length} page(s))`, error: '' });
     } catch (e) {
@@ -87,7 +108,9 @@ export function buildDashboardImportTaskList(payload, selections) {
  * Recreates the bundled dashboards here, rewriting queries from the source account to this
  * one. `sourceAccountId` comes from the bundle envelope.
  */
-export async function applyDashboardsBundle({ client, accountId, payload, selections, sourceAccountId, onProgress }) {
+export async function applyDashboardsBundle({
+  client, accountId, payload, selections, sourceAccountId, newTags = [], newTagTargets = null, onProgress
+}) {
   const chosen = (payload.dashboards || []).filter(d => selections[d.name]);
 
   // Checked once, before anything is created. Without the source account ID there is no way to
@@ -121,7 +144,30 @@ export async function applyDashboardsBundle({ client, accountId, payload, select
       );
 
       const result = await createTargetDashboard(client, accountId, input);
-      onProgress(i, { status: 'SUCCESS', detail: `Created (GUID ${result.guid})` });
+
+      // Tags recorded at export, merged with anything the importer is adding now. Targeting
+      // here is by name - the only identifier a bundle carries.
+      const tags = resolveTagsForItem({
+        preserved: dashboard.userTags,
+        newTags,
+        targets: newTagTargets,
+        itemId: dashboard.name
+      });
+
+      let tagNote = '';
+      if (tags.length > 0) {
+        const outcome = await copyUserTagsToEntity(client, result.guid, tags);
+        if (outcome?.written) tagNote = `, ${outcome.written} tag(s) applied`;
+        else if (outcome?.error) {
+          onProgress(i, {
+            status: 'MANUAL',
+            error: `Created (GUID ${result.guid}), but tags could not be applied: ${outcome.error}. Add them by hand if you filter on them.`
+          });
+          continue;
+        }
+      }
+
+      onProgress(i, { status: 'SUCCESS', detail: `Created (GUID ${result.guid})${tagNote}` });
     } catch (e) {
       onProgress(i, { status: 'FAILED', error: e.message });
     }

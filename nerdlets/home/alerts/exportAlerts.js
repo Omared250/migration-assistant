@@ -23,6 +23,7 @@ import {
   discoverPolicyTree,
   fetchSingleConditionDetails,
   fetchUserTagsForEntities,
+  resolveTagsForItem,
   discoverWorkflows,
   discoverMutingRules,
   discoverNonNrqlConditions,
@@ -90,10 +91,12 @@ const MUTING_UNPORTABLE_ATTRS = new Set(['entity.guid', 'entityGuid', 'targetId'
  * @param {string}   args.accountId
  * @param {object}   args.inventory    from discoverAlertsInventory
  * @param {object}   args.selections   { destinations, policies, conditions, workflows, mutingRules } id -> bool
+ * @param {object[]} args.newTags      [{ key, values }] the user is adding in this run, or []
+ * @param {object}   args.newTagTargets { [conditionId]: true }, or null for every condition
  * @param {function} args.onLog        (row) => void, progress for the UI
  * @returns {Promise<{payload: object, warnings: string[]}>}
  */
-export async function gatherAlertsForExport({ client, accountId, inventory, selections, onLog }) {
+export async function gatherAlertsForExport({ client, accountId, inventory, selections, newTags = [], newTagTargets = null, onLog }) {
   const warnings = [];
   const log = (stepName, status, detail = '', error = '') => onLog({ stepName, status, detail, error });
 
@@ -183,15 +186,24 @@ export async function gatherAlertsForExport({ client, accountId, inventory, sele
     for (const cond of conditions) {
       try {
         const details = await fetchSingleConditionDetails(client, accountId, cond.id);
-        const userTags = tagsByGuid.get(cond.entityGuid);
+
+        // The per-item choice is resolved HERE, while condition IDs still mean something.
+        // By import time the only identifier left is the name, so the bundle records the
+        // effective tag set per condition rather than the selection that produced it.
+        const userTags = resolveTagsForItem({
+          preserved: tagsByGuid.get(cond.entityGuid),
+          newTags,
+          targets: newTagTargets,
+          itemId: cond.id
+        });
 
         // Stored as fetched. The importer feeds this straight into the same
         // createTargetNrqlCondition() the live path uses, so the schema handling
         // (static vs baseline, signal timing, the degraded-retry) is shared.
         //
-        // `userTags` is names and values only - no guid, no id - so it carries nothing
+        // `userTags` is keys and values only - no guid, no id - so it carries nothing
         // account-scoped across the org boundary.
-        exportedConditions.push(userTags ? { ...details, userTags } : details);
+        exportedConditions.push(userTags.length > 0 ? { ...details, userTags } : details);
       } catch (e) {
         failures.push(`${cond.name}: ${e.message}`);
       }

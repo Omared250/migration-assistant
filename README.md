@@ -144,9 +144,11 @@ Deliberately left alone:
 
 Older dashboards exist as several sibling entities named `Parent / Page`. These are detected, grouped, and consolidated into a single multi-page dashboard with de-duplicated page names. The selection list badges them as *Legacy tab group*.
 
-### Not migrated
+### Tags
 
-- **Dashboard tags** — not copied.
+A dashboard's tags **are** copied to the migrated copy — always, with nothing to opt into. Creating a dashboard doesn't carry tags over (`DashboardInput` has no tag field), so the tool re-applies them afterwards. For a legacy tab group, the tags of every sibling entity that was merged are unioned onto the single resulting dashboard.
+
+Only *your* tags are copied. New Relic's own metadata tags are left alone.
 
 ---
 
@@ -234,6 +236,23 @@ Multi-location synthetics conditions have a second problem: they reference monit
 - **Muting rules targeting specific entities** (`entity.guid`, `targetId`) cannot cross an org boundary — there's no equivalent entity on the other side. They're reported, not silently dropped.
 - **Muting rule schedules without a time zone** are refused; guessing one would shift the window.
 - A condition whose advanced settings are rejected is retried with core fields only, and reported as **needs attention** rather than a clean success, naming what was reset.
+
+---
+
+## Adding your own tags during a migration
+
+Separate from tag copying, every migration asks one question before it runs:
+
+> **Add new tags to the migrated dashboards / conditions?**  → *No* / *Yes*
+
+**No** is the default and behaves exactly as the tool did before. **Yes** opens a tag editor (key/value rows) and a choice of where they land: **all** the items in this run, or **only the ones you pick**.
+
+- Each module keeps its own tags — tags entered in the alerts migration never reach dashboards, or the other way round.
+- **Dashboards and NRQL conditions only.** Channels and muting rules aren't entities and have no GUID to tag; policies, workflows and destinations are out of scope by design.
+- A new tag **overrides** a copied one with the same key, rather than leaving the item with both values.
+- Narrowing to a subset never strips tags: an item you didn't pick still keeps the tags it had in the source.
+- Available in **all three scenarios**. For export/import the choice is resolved at export and recorded in the bundle, and the person importing can add more on top.
+- If tagging fails (usually a permissions gap) the dashboard or condition is still created and the row is flagged ⚠️ rather than reported as a clean success.
 
 ---
 
