@@ -91,14 +91,90 @@ export async function discoverDashboards(client, accountId, criteria) {
   // its parent did not, the group was left with no parent guid and fell back to the PAGE
   // entity's guid. Migrating that guid produces a one-page dashboard - the other pages silently
   // gone. Grouping first means a match always carries the whole dashboard.
+  // A name is only treated as "Parent / Page" when a dashboard by that parent name ACTUALLY
+  // EXISTS in the results. Splitting on the first " / " instead looks obvious and is wrong:
+  // a dashboard genuinely titled "Digital_integration_APIM_Non_PROD / ODP PR" was being filed
+  // under an invented parent "Digital_integration_APIM_Non_PROD", shown under that truncated
+  // name, and would have been recreated with the rest of its title missing.
+  //
+  // Longest match wins, so "A / B / C" is read as a page of "A / B" when that dashboard exists,
+  // and as page "B / C" of "A" when only "A" does.
+  // Resolved in two passes, because an entity that is itself a page must not then be treated as
+  // some other entity's parent. With A, "A / B" and "A / B / C" all present, a single pass filed
+  // "A / B" as a page of A while still using it as the parent of "A / B / C" - leaving a group
+  // named "A / B" with no dashboard in it.
+  const allNames = new Set(entities.map(e => (e.name || '').trim()));
+
+  // Every " / " boundary prefix of a name, longest first.
+  const prefixesOf = (name) => {
+    const out = [];
+    let idx = name.lastIndexOf(' / ');
+    while (idx > 0) {
+      out.push(name.slice(0, idx));
+      idx = name.lastIndexOf(' / ', idx - 1);
+    }
+    return out;
+  };
+
+  // Pass 1: a name is a dashboard when no prefix of it is also an entity name. Anything else is
+  // a page of something.
+  const dashboardNames = new Set(
+    [...allNames].filter(name => !prefixesOf(name).some(p => allNames.has(p)))
+  );
+
+  // Pass 2: a page belongs to the longest prefix that is an actual DASHBOARD.
+  const parentNameOf = (name) => {
+    if (dashboardNames.has(name)) return null;
+    return prefixesOf(name).find(p => dashboardNames.has(p)) || null;
+  };
+
+  // Pass 3: legacy tabbed dashboards. Those exist as several sibling dashboards "Parent / Tab"
+  // with no parent entity, and are consolidated into one multi-page dashboard.
+  //
+  // The test is whether TWO OR MORE dashboards share a prefix that is not itself an entity.
+  // One alone is a dashboard whose title simply contains " / " and must keep its full name -
+  // which is the only case that actually occurs in the accounts measured here.
+  const firstPrefix = (name) => {
+    const i = name.indexOf(' / ');
+    return i > 0 ? name.slice(0, i) : null;
+  };
+
+  const prefixCounts = new Map();
+  for (const name of dashboardNames) {
+    const p = firstPrefix(name);
+    if (p && !allNames.has(p)) prefixCounts.set(p, (prefixCounts.get(p) || 0) + 1);
+  }
+  const legacyPrefixes = new Set(
+    [...prefixCounts.entries()].filter(([, count]) => count > 1).map(([p]) => p)
+  );
+
+  /** Which group an entity belongs to, and under what page name. */
+  const placeEntity = (name) => {
+    const parent = parentNameOf(name);
+
+    // A page. If its dashboard was folded into a legacy group, the page follows it there.
+    if (parent !== null) {
+      const legacy = firstPrefix(parent);
+      if (legacy && legacyPrefixes.has(legacy)) {
+        return { groupName: legacy, pageName: name.slice(legacy.length + 3).trim(), isParentEntity: false };
+      }
+      return { groupName: parent, pageName: name.slice(parent.length + 3).trim(), isParentEntity: false };
+    }
+
+    // A dashboard - unless it is one tab of a legacy group.
+    const legacy = firstPrefix(name);
+    if (legacy && legacyPrefixes.has(legacy)) {
+      return { groupName: legacy, pageName: name.slice(legacy.length + 3).trim(), isParentEntity: false };
+    }
+    return { groupName: name, pageName: 'Overview', isParentEntity: true };
+  };
+
   const groups = new Map();
 
   for (const item of entities) {
     const name = (item.name || '').trim();
-    const sep = name.indexOf(' / ');
-    const isPageEntity = sep !== -1;
-    const parentName = isPageEntity ? name.slice(0, sep).trim() : name;
-    const pageName = isPageEntity ? name.slice(sep + 3).trim() : 'Overview';
+    const { groupName: parentName, pageName, isParentEntity } = placeEntity(name);
+    const isPageEntity = !isParentEntity;
 
     if (!groups.has(parentName)) {
       groups.set(parentName, {
@@ -113,7 +189,10 @@ export async function discoverDashboards(client, accountId, criteria) {
     }
 
     const group = groups.get(parentName);
-    group.pagesToMigrate.push({ pageName, guid: item.guid });
+    // isParentEntity marks the dashboard's own entity. Its "Overview" page name is synthesized
+    // here, not read from the dashboard, so it must never be matched against - otherwise
+    // searching "overview" would return every dashboard in the account.
+    group.pagesToMigrate.push({ pageName, guid: item.guid, isParentEntity: !isPageEntity });
     group.groupTags.push(...(item.tags || []));
 
     // The entity whose name has no " / " IS the dashboard. Its guid is the one to migrate from.
@@ -125,12 +204,35 @@ export async function discoverDashboards(client, accountId, criteria) {
 
   let dashboards = [...groups.values()];
 
-  // Filters apply to the DASHBOARD, not to its pages. Matching page names would return a
-  // dashboard whose own name has nothing to do with the search, with nothing on screen to
-  // explain why - and it is what made pages look like separate dashboards.
+  // KEYWORD: every whitespace-separated term must be present, and a term may be matched by the
+  // dashboard's own name OR by one of its page names.
+  //
+  // Both halves of that came from real failures. A single literal substring meant "Boomi logs"
+  // found nothing at all, because no name contains that exact text - while the dashboard the
+  // user wanted, Boomi_Audit_Logs_NonProd_Dashboard, contains both words. And searching page
+  // names is what makes a dashboard whose 12 pages are all named "Boomi*" findable by "Boomi".
+  //
+  // All terms must land on the SAME name, so there is always one concrete thing to point at as
+  // the reason. `matchedOnPage` carries it, because a result whose own name lacks the search
+  // text is confusing unless the UI can say which page matched.
   if (criteria.type === 'KEYWORD' && criteria.keyword) {
-    const kw = criteria.keyword.trim().toLowerCase();
-    dashboards = dashboards.filter(d => d.name.toLowerCase().includes(kw));
+    const terms = criteria.keyword.trim().toLowerCase().split(/\s+/).filter(Boolean);
+
+    if (terms.length > 0) {
+      const matchesAllTerms = (text) => {
+        const haystack = (text || '').toLowerCase();
+        return terms.every(term => haystack.includes(term));
+      };
+
+      dashboards = dashboards
+        .map(d => {
+          if (matchesAllTerms(d.name)) return { ...d, matchedOnPage: null };
+
+          const page = d.pagesToMigrate.find(p => !p.isParentEntity && matchesAllTerms(p.pageName));
+          return page ? { ...d, matchedOnPage: page.pageName } : null;
+        })
+        .filter(Boolean);
+    }
   }
 
   if (criteria.type === 'TAG' && criteria.tagKey && criteria.tagValue) {

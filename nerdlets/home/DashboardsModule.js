@@ -120,7 +120,22 @@ export default function DashboardsModule({ client, connection, updateConnection,
       }
 
       const list = await discoverDashboards(client, sourceAccountId, { type: filterType, keyword, tagKey, tagValue });
-      if (list.length === 0) throw new Error('No dashboards found matching the selected criteria.');
+
+      // Says what was actually searched for. "No dashboards found" on its own cannot be told
+      // apart from a fetch problem, which is exactly how a keyword that simply matched nothing
+      // got reported as a bug.
+      if (list.length === 0) {
+        const terms = keyword.trim().split(/\s+/).filter(Boolean);
+        const what =
+          filterType === 'KEYWORD'
+            ? `No dashboard in account ${sourceAccountId} has ${terms.length > 1
+                ? `all of these words in its name or in one of its page names: ${terms.join(', ')}`
+                : `"${terms[0]}" in its name or in one of its page names`}.`
+            : filterType === 'TAG'
+              ? `No dashboard in account ${sourceAccountId} is tagged ${tagKey.trim()} = ${tagValue.trim()}.`
+              : `Account ${sourceAccountId} has no dashboards.`;
+        throw new Error(what);
+      }
 
       const selection = {};
       list.forEach(item => { selection[item.guid] = true; });
@@ -414,6 +429,11 @@ export default function DashboardsModule({ client, connection, updateConnection,
                 {db.isOrphan
                   ? <span className="badge-tabs">Rebuilt from {db.pagesToMigrate.length} page entities</span>
                   : db.pageCount > 1 && <span className="badge-tabs">{db.pageCount - 1} page(s)</span>}
+                {/* Without this, a keyword hit on a page name looks like a bug: the dashboard's
+                    own name does not contain what was searched for. */}
+                {db.matchedOnPage && (
+                  <span className="badge-tabs">matched page: {db.matchedOnPage}</span>
+                )}
               </>
             )}
           />
