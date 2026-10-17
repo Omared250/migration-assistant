@@ -127,9 +127,37 @@ So the data moves as a **JSON bundle file** instead. Each pass only ever touches
 
 ### What you can do
 
-1. **Discover** by *all dashboards*, *keyword in the name*, or *tag key/value*.
+1. **Discover** by *all dashboards*, *keyword*, or *tag key/value*.
 2. **Migrate live** (same org + region) — read source, create in target, one pass.
 3. **Export / Import** (cross org or region) — download selected dashboards, then create them in the target.
+
+### Discovery returns everything
+
+All three options return **every** matching dashboard in the account. Discovery follows New Relic's `entitySearch` cursor to the end — the API caps a single response at 200 entities, and because each dashboard publishes one entity per page as well as itself, an account can hold far more entities than dashboards.
+
+### How the keyword filter matches
+
+| | |
+|---|---|
+| **Where it looks** | The dashboard's name, and the names of its pages/tabs |
+| **Multiple words** | Every word must be present (AND), all on the same name |
+| **Matching** | Case-insensitive substring; word order is irrelevant |
+| **Not searched** | Widget titles, NRQL, descriptions, tags |
+
+So `Boomi logs` finds `Boomi_Audit_Logs_NonProd_Dashboard` — the words don't have to be adjacent or in order. `non prod` finds `BTP_NonProd_Dashboard`.
+
+When a dashboard matches through one of its pages rather than its own name, the selection list says which page — otherwise a result whose title doesn't contain your search text looks like a bug.
+
+### How the tag filter matches
+
+Key and value must both match exactly, case-insensitively. Evaluated against **every tag on the dashboard and on its page entities**, so it covers both:
+
+- **Tags New Relic sets when a dashboard is created** — `permissions`, `createdBy`, `accountId`, `trustedAccountId`, `isDashboardPage`, `parentId`
+- **Tags you add yourself** — any key/value
+
+A tag that sits only on a page still returns the whole dashboard. If nothing matches, the error lists the tag keys the account actually uses (and, for a key that exists, the values in use) rather than just reporting no results.
+
+Alert **policies** can't be searched by tag — see the alerts section.
 
 ### What it changes, and what it doesn't
 
@@ -142,9 +170,21 @@ Deliberately left alone:
 - **Variables** — copied, including their `accountIds`.
 - **Widgets querying a third account** — preserved. Only the source account is substituted.
 
-### Legacy tabbed dashboards
+### Pages are never treated as separate dashboards
 
-Older dashboards exist as several sibling entities named `Parent / Page`. These are detected, grouped, and consolidated into a single multi-page dashboard with de-duplicated page names. The selection list badges them as *Legacy tab group*.
+A dashboard appears in New Relic's entity list as itself **plus one entity per page**, named `Parent / Page`. Those page entities are a second view of the same dashboard, not dashboards of their own, so they're grouped back onto their parent. A migrated dashboard always arrives with all of its pages, with page names and order unchanged.
+
+Grouping uses the data rather than guessing from the name: a name is only read as `Parent / Page` when a dashboard by that parent name actually exists. That matters for a dashboard whose own title contains `" / "` — for example `Digital_integration_APIM_Non_PROD / ODP PR`, which keeps its full title instead of being filed under a truncated parent that doesn't exist.
+
+**Legacy tabbed dashboards** — older accounts have dashboards that exist only as several sibling `Parent / Tab` entities with no parent. When two or more siblings share a prefix like that, they're consolidated into one multi-page dashboard with de-duplicated page names, badged *Rebuilt from N page entities*.
+
+### Widgets that can't be copied
+
+A widget whose configuration New Relic refuses to return comes back marked `viz.inaccessible` with no queries or settings attached — normally because you lack access to the account it queries. There's nothing in it to copy.
+
+Those widgets are **skipped**, and the row is reported as ⚠️ naming the count and the page. Previously the whole dashboard failed: one such widget fails its entire page, so the other widgets on it were lost too. A dashboard where *every* widget is inaccessible is refused with that reason rather than arriving empty.
+
+Widgets drawn by a **custom nerdpack visualization** are copied but only render where that nerdpack is also deployed — flagged in the same note.
 
 ### Tags
 
@@ -316,4 +356,7 @@ nerdlets/home/
 | Only NRQL conditions migrated | No API to enumerate other condition types |
 | Tag filtering matches conditions, not policies | `policiesSearch` has no tag criteria; condition entities do carry tags |
 | A filtered run copies only the matched conditions | Its policy is created so they have a parent, but its other conditions are not included |
+| Inaccessible widgets are skipped, not copied | The API returns no configuration for them; sending one fails its whole page |
+| Custom-visualization widgets may not render in the target | They need their nerdpack deployed there too |
+| Dashboard owner / `createdBy` cannot be preserved | `DashboardInput` accepts no owner field; the creator is whoever runs the migration |
 | Synthetics monitors not migrated | Not implemented yet |
