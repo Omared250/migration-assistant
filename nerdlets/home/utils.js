@@ -27,6 +27,58 @@ export function isSelected(map, key) {
  * DASHBOARDS MIGRATION MODULE (PHASE 1) - UNTOUCHED
  *************************************************************/
 
+const MAX_LISTED_TAG_VALUES = 12;
+
+/**
+ * Why a search returned nothing, in terms the user can act on.
+ *
+ * "No dashboards found matching the selected criteria" was indistinguishable from a fetch
+ * problem - and it was reported as one. For a tag search it also lists what the account
+ * actually has, since guessing a key name is the likeliest mistake.
+ */
+function describeEmptyResult(criteria, accountId, totalDashboards, tagIndex) {
+  if (totalDashboards === 0) {
+    return `Account ${accountId} has no dashboards, or you do not have access to them.`;
+  }
+
+  if (criteria.type === 'KEYWORD') {
+    const terms = (criteria.keyword || '').trim().split(/\s+/).filter(Boolean);
+    const what = terms.length > 1
+      ? `all of these words: ${terms.join(', ')}`
+      : `"${terms[0]}"`;
+    return (
+      `None of the ${totalDashboards} dashboard(s) in account ${accountId} has ${what} in its ` +
+      `name or in one of its page names.`
+    );
+  }
+
+  if (criteria.type === 'TAG') {
+    const wantedKey = (criteria.tagKey || '').trim();
+    const wantedVal = (criteria.tagValue || '').trim();
+
+    // Key lookup is case-insensitive, same as the filter itself.
+    const actualKey = [...tagIndex.keys()].find(k => k.toLowerCase() === wantedKey.toLowerCase());
+
+    if (!actualKey) {
+      const keys = [...tagIndex.keys()].sort();
+      return (
+        `No dashboard in account ${accountId} has a tag named "${wantedKey}". ` +
+        `Tags in use here: ${keys.join(', ')}.`
+      );
+    }
+
+    const values = [...tagIndex.get(actualKey)].sort();
+    const shown = values.slice(0, MAX_LISTED_TAG_VALUES).join(', ');
+    const more = values.length > MAX_LISTED_TAG_VALUES ? `, and ${values.length - MAX_LISTED_TAG_VALUES} more` : '';
+    return (
+      `No dashboard in account ${accountId} is tagged ${actualKey} = "${wantedVal}". ` +
+      `Values in use for ${actualKey}: ${shown}${more}.`
+    );
+  }
+
+  return `No dashboards in account ${accountId} matched the selected criteria.`;
+}
+
 export async function discoverDashboards(client, accountId, criteria) {
   // Coerced to a number before interpolation. The account ID comes from a free-text input, and
   // entitySearch takes a query *language* string - so pasting `123 OR name LIKE '%'` in that box
@@ -184,7 +236,10 @@ export async function discoverDashboards(client, accountId, criteria) {
         pagesToMigrate: [],
         // Every tag on every entity in the group, so a tag filter matches whether the user
         // tagged the dashboard or one of its pages.
-        groupTags: []
+        groupTags: [],
+        // Just the dashboard's own tags, so a match can report whether it came from the
+        // dashboard or from one of its pages.
+        ownTags: []
       });
     }
 
@@ -192,13 +247,16 @@ export async function discoverDashboards(client, accountId, criteria) {
     // isParentEntity marks the dashboard's own entity. Its "Overview" page name is synthesized
     // here, not read from the dashboard, so it must never be matched against - otherwise
     // searching "overview" would return every dashboard in the account.
-    group.pagesToMigrate.push({ pageName, guid: item.guid, isParentEntity: !isPageEntity });
+    group.pagesToMigrate.push({
+      pageName, guid: item.guid, isParentEntity: !isPageEntity, tags: item.tags || []
+    });
     group.groupTags.push(...(item.tags || []));
 
-    // The entity whose name has no " / " IS the dashboard. Its guid is the one to migrate from.
+    // This entity IS the dashboard. Its guid is the one to migrate from.
     if (!isPageEntity) {
       group.guid = item.guid;
       group.accountId = item.accountId;
+      group.ownTags.push(...(item.tags || []));
     }
   }
 
@@ -235,18 +293,53 @@ export async function discoverDashboards(client, accountId, criteria) {
     }
   }
 
+  // TAG: matches on EVERY tag a dashboard carries - the ones New Relic sets when a dashboard is
+  // created (permissions, createdBy, accountId, isDashboardPage, parentId, trustedAccountId)
+  // and any the user added. Nothing is filtered out of the comparison, so whatever appears in
+  // the tag index below can be searched for.
+  //
+  // Tags are matched at group level, because a tag can sit on the dashboard, on its page
+  // entities, or on both - measured: permissions/createdBy/accountId are on all of them, while
+  // user-added tags are on the dashboard only.
   if (criteria.type === 'TAG' && criteria.tagKey && criteria.tagValue) {
     const targetKey = criteria.tagKey.trim().toLowerCase();
     const targetVal = criteria.tagValue.trim().toLowerCase();
+    const hasTag = (tags) => (tags || []).some(tag =>
+      (tag.key || '').toLowerCase() === targetKey &&
+      (tag.values || []).some(val => (val || '').toLowerCase() === targetVal)
+    );
 
-    dashboards = dashboards.filter(d => (d.groupTags || []).some(tag => {
-      const isKeyMatch = (tag.key || '').toLowerCase() === targetKey;
-      const hasValueMatch = (tag.values || []).some(val => (val || '').toLowerCase() === targetVal);
-      return isKeyMatch && hasValueMatch;
-    }));
+    dashboards = dashboards
+      .map(d => {
+        // Reported the same way as a keyword page hit, so a result whose own tags do not
+        // obviously match is still explainable.
+        if (hasTag(d.ownTags)) return { ...d, matchedOnPage: null };
+        if (hasTag(d.groupTags)) {
+          const page = d.pagesToMigrate.find(p => !p.isParentEntity && hasTag(p.tags));
+          return { ...d, matchedOnPage: page ? page.pageName : null };
+        }
+        return null;
+      })
+      .filter(Boolean);
   }
 
-  return dashboards.map(({ groupTags, ...d }) => ({
+  // Every tag key and value present in the account, so a search that matches nothing can say
+  // what IS available instead of just "not found" - which is what made a mistyped or
+  // non-existent tag key indistinguishable from a fetch failure.
+  const tagIndex = new Map();
+  for (const group of groups.values()) {
+    for (const tag of group.groupTags || []) {
+      const key = tag.key || '';
+      if (!tagIndex.has(key)) tagIndex.set(key, new Set());
+      (tag.values || []).forEach(v => tagIndex.get(key).add(v));
+    }
+  }
+
+  if (dashboards.length === 0) {
+    throw new Error(describeEmptyResult(criteria, numericAccountId, groups.size, tagIndex));
+  }
+
+  return dashboards.map(({ groupTags, ownTags, ...d }) => ({
     ...d,
     // True only when no parent entity was found - the dashboard exists solely as page entities.
     // Measured at 0 of 30 dashboards across five accounts, but the migration keeps a merge path

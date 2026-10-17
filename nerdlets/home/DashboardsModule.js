@@ -119,23 +119,9 @@ export default function DashboardsModule({ client, connection, updateConnection,
         await verifySingleAccount(client, sourceAccountId);
       }
 
+      // discoverDashboards throws a precise reason when nothing matches - it is the only place
+      // that knows how many dashboards were scanned and which tags the account actually uses.
       const list = await discoverDashboards(client, sourceAccountId, { type: filterType, keyword, tagKey, tagValue });
-
-      // Says what was actually searched for. "No dashboards found" on its own cannot be told
-      // apart from a fetch problem, which is exactly how a keyword that simply matched nothing
-      // got reported as a bug.
-      if (list.length === 0) {
-        const terms = keyword.trim().split(/\s+/).filter(Boolean);
-        const what =
-          filterType === 'KEYWORD'
-            ? `No dashboard in account ${sourceAccountId} has ${terms.length > 1
-                ? `all of these words in its name or in one of its page names: ${terms.join(', ')}`
-                : `"${terms[0]}" in its name or in one of its page names`}.`
-            : filterType === 'TAG'
-              ? `No dashboard in account ${sourceAccountId} is tagged ${tagKey.trim()} = ${tagValue.trim()}.`
-              : `Account ${sourceAccountId} has no dashboards.`;
-        throw new Error(what);
-      }
 
       const selection = {};
       list.forEach(item => { selection[item.guid] = true; });
