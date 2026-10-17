@@ -144,7 +144,7 @@ All three options return **every** matching dashboard in the account. Discovery 
 | **Matching** | Case-insensitive substring; word order is irrelevant |
 | **Not searched** | Widget titles, NRQL, descriptions, tags |
 
-So `Boomi logs` finds `Boomi_Audit_Logs_NonProd_Dashboard` — the words don't have to be adjacent or in order. `non prod` finds `BTP_NonProd_Dashboard`.
+So `payments logs` finds `Payments_Audit_Logs_NonProd_Dashboard` — the words don't have to be adjacent or in order. `non prod` finds `Checkout_NonProd_Dashboard`.
 
 When a dashboard matches through one of its pages rather than its own name, the selection list says which page — otherwise a result whose title doesn't contain your search text looks like a bug.
 
@@ -174,7 +174,7 @@ Deliberately left alone:
 
 A dashboard appears in New Relic's entity list as itself **plus one entity per page**, named `Parent / Page`. Those page entities are a second view of the same dashboard, not dashboards of their own, so they're grouped back onto their parent. A migrated dashboard always arrives with all of its pages, with page names and order unchanged.
 
-Grouping uses the data rather than guessing from the name: a name is only read as `Parent / Page` when a dashboard by that parent name actually exists. That matters for a dashboard whose own title contains `" / "` — for example `Digital_integration_APIM_Non_PROD / ODP PR`, which keeps its full title instead of being filed under a truncated parent that doesn't exist.
+Grouping uses the data rather than guessing from the name: a name is only read as `Parent / Page` when a dashboard by that parent name actually exists. That matters for a dashboard whose own title contains `" / "` — for example one called `Platform_API_NonProd / Release 2` keeps its full title, instead of being filed under a truncated parent `Platform_API_NonProd` that doesn't exist.
 
 **Legacy tabbed dashboards** — older accounts have dashboards that exist only as several sibling `Parent / Tab` entities with no parent. When two or more siblings share a prefix like that, they're consolidated into one multi-page dashboard with de-duplicated page names, badged *Rebuilt from N page entities*.
 
