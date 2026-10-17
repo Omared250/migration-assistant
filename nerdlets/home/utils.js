@@ -39,11 +39,17 @@ export async function discoverDashboards(client, accountId, criteria) {
 
   const queryStr = `type = 'DASHBOARD' AND accountId = ${numericAccountId}`;
 
+  // PAGINATED. entitySearch returns at most 200 entities per page and signals more with a
+  // nextCursor. This query used to read only the first page, so an account with more than 200
+  // dashboard entities silently lost the rest - and because legacy tab groups arrive as one
+  // entity per tab (roughly 3-4 entities per real dashboard), 200 entities can collapse to
+  // only ~56 parents. Everything past the first page was simply invisible, with no warning.
   const query = `
-    query DiscoverDashboards($queryStr: String!) {
+    query DiscoverDashboards($queryStr: String!, $cursor: String) {
       actor {
         entitySearch(query: $queryStr) {
-          results {
+          results(cursor: $cursor) {
+            nextCursor
             entities {
               __typename
               guid
@@ -59,71 +65,94 @@ export async function discoverDashboards(client, accountId, criteria) {
       }
     }
   `;
-  
-  const data = await client.query(query, { queryStr });
-  let entities = data?.actor?.entitySearch?.results?.entities || [];
-  
+
+  let entities = await collectAllPages(async (cursor) => {
+    const data = await client.query(query, { queryStr, cursor });
+    const page = data?.actor?.entitySearch?.results;
+    return { items: page?.entities || [], nextCursor: page?.nextCursor };
+  });
+
+  // Dashboard pages are NOT a distinct entity type - every result is a DashboardEntityOutline,
+  // so this removes nothing today. Kept because it costs nothing and guards against a future
+  // page-specific type; the real page/parent split is the " / " name grouping further down.
   entities = entities.filter(e => {
     const typeName = (e.__typename || '').toLowerCase();
     return !typeName.includes('page');
   });
-  
+
+  // GROUP FIRST, THEN FILTER.
+  //
+  // A dashboard shows up in entitySearch as its own entity PLUS one entity per page, named
+  // "Parent / Page". Those page entities are a second view of the same dashboard - the parent's
+  // own `pages` list already contains every page - so they are never dashboards in their own
+  // right.
+  //
+  // Filtering before grouping (what this used to do) broke that: if a page entity matched but
+  // its parent did not, the group was left with no parent guid and fell back to the PAGE
+  // entity's guid. Migrating that guid produces a one-page dashboard - the other pages silently
+  // gone. Grouping first means a match always carries the whole dashboard.
+  const groups = new Map();
+
+  for (const item of entities) {
+    const name = (item.name || '').trim();
+    const sep = name.indexOf(' / ');
+    const isPageEntity = sep !== -1;
+    const parentName = isPageEntity ? name.slice(0, sep).trim() : name;
+    const pageName = isPageEntity ? name.slice(sep + 3).trim() : 'Overview';
+
+    if (!groups.has(parentName)) {
+      groups.set(parentName, {
+        name: parentName,
+        guid: null,
+        accountId: item.accountId,
+        pagesToMigrate: [],
+        // Every tag on every entity in the group, so a tag filter matches whether the user
+        // tagged the dashboard or one of its pages.
+        groupTags: []
+      });
+    }
+
+    const group = groups.get(parentName);
+    group.pagesToMigrate.push({ pageName, guid: item.guid });
+    group.groupTags.push(...(item.tags || []));
+
+    // The entity whose name has no " / " IS the dashboard. Its guid is the one to migrate from.
+    if (!isPageEntity) {
+      group.guid = item.guid;
+      group.accountId = item.accountId;
+    }
+  }
+
+  let dashboards = [...groups.values()];
+
+  // Filters apply to the DASHBOARD, not to its pages. Matching page names would return a
+  // dashboard whose own name has nothing to do with the search, with nothing on screen to
+  // explain why - and it is what made pages look like separate dashboards.
   if (criteria.type === 'KEYWORD' && criteria.keyword) {
     const kw = criteria.keyword.trim().toLowerCase();
-    entities = entities.filter(e => e.name.toLowerCase().includes(kw));
+    dashboards = dashboards.filter(d => d.name.toLowerCase().includes(kw));
   }
-  
+
   if (criteria.type === 'TAG' && criteria.tagKey && criteria.tagValue) {
     const targetKey = criteria.tagKey.trim().toLowerCase();
     const targetVal = criteria.tagValue.trim().toLowerCase();
-    
-    entities = entities.filter(entity => {
-      return (entity.tags || []).some(tag => {
-        const isKeyMatch = tag.key.toLowerCase() === targetKey;
-        const hasValueMatch = (tag.values || []).some(val => val.toLowerCase() === targetVal);
-        return isKeyMatch && hasValueMatch;
-      });
-    });
+
+    dashboards = dashboards.filter(d => (d.groupTags || []).some(tag => {
+      const isKeyMatch = (tag.key || '').toLowerCase() === targetKey;
+      const hasValueMatch = (tag.values || []).some(val => (val || '').toLowerCase() === targetVal);
+      return isKeyMatch && hasValueMatch;
+    }));
   }
 
-  const groupedParents = {};
-  
-  entities.forEach(item => {
-    const name = (item.name || '').trim();
-    let parentName = name;
-    let pageName = 'Overview';
-    
-    if (name.includes(' / ')) {
-      const parts = name.split(' / ');
-      parentName = parts[0].trim();
-      pageName = parts.slice(1).join(' / ').trim();
-    }
-    
-    if (!groupedParents[parentName]) {
-      groupedParents[parentName] = {
-        name: parentName,
-        guid: parentName === name ? item.guid : null,
-        accountId: item.accountId,
-        pagesToMigrate: []
-      };
-    }
-    
-    groupedParents[parentName].pagesToMigrate.push({
-      pageName: pageName,
-      guid: item.guid
-    });
-    
-    if (parentName === name) {
-      groupedParents[parentName].guid = item.guid;
-    }
-  });
-
-  return Object.values(groupedParents).map(p => {
-    if (!p.guid && p.pagesToMigrate.length > 0) {
-      p.guid = p.pagesToMigrate[0].guid;
-    }
-    return p;
-  });
+  return dashboards.map(({ groupTags, ...d }) => ({
+    ...d,
+    // True only when no parent entity was found - the dashboard exists solely as page entities.
+    // Measured at 0 of 30 dashboards across five accounts, but the migration keeps a merge path
+    // for it rather than assuming.
+    isOrphan: !d.guid,
+    guid: d.guid || d.pagesToMigrate[0]?.guid || null,
+    pageCount: d.pagesToMigrate.length
+  }));
 }
 
 export async function fetchSourceDashboard(client, guid) {
@@ -335,6 +364,44 @@ export function mapVariables(variablesList, sourceAccountId, targetAccountId, { 
   });
 }
 
+/**
+ * The visualization id New Relic substitutes for a widget the reader is not allowed to see.
+ * Such a widget comes back with this id and an EMPTY rawConfiguration - its queries, title
+ * and settings were never returned, so there is nothing to copy.
+ */
+export const INACCESSIBLE_VIZ_ID = 'viz.inaccessible';
+
+const isInaccessibleWidget = (widget) =>
+  (widget?.visualization?.id || '') === INACCESSIBLE_VIZ_ID;
+
+/**
+ * What a dashboard cannot bring across, or will need attention for, before anything is created.
+ *
+ *   inaccessible  widgets the API refused to describe. Copying one verbatim makes
+ *                 dashboardCreate reject the whole page with "an input inaccessible widget
+ *                 must have a widget id", taking every other widget on that page with it.
+ *   customViz     widgets drawn by a nerdpack visualization rather than a built-in one. These
+ *                 copy fine, but render only where that nerdpack is also deployed.
+ */
+export function inspectDashboardWidgets(entity) {
+  const inaccessible = [];
+  const customViz = [];
+  let total = 0;
+
+  for (const page of entity?.pages || []) {
+    for (const widget of page.widgets || []) {
+      total += 1;
+      const vizId = widget?.visualization?.id || '';
+      const where = { page: page.name, title: widget.title || '(untitled)' };
+
+      if (isInaccessibleWidget(widget)) inaccessible.push(where);
+      else if (vizId && !vizId.startsWith('viz.')) customViz.push({ ...where, vizId });
+    }
+  }
+
+  return { total, copyable: total - inaccessible.length, inaccessible, customViz };
+}
+
 export function mapPageToDashboardPageInput(page, sourceAccountId, targetAccountId) {
   if (!page) return null;
 
@@ -342,7 +409,10 @@ export function mapPageToDashboardPageInput(page, sourceAccountId, targetAccount
 
   return {
     name: page.name,
-    widgets: (page.widgets || []).map(widget => {
+    // Inaccessible widgets are dropped rather than copied. They carry no configuration, and
+    // sending one fails the entire page - so keeping them would cost every other widget on it.
+    // An empty widget list is valid input, so a page made entirely of them still comes across.
+    widgets: (page.widgets || []).filter(w => !isInaccessibleWidget(w)).map(widget => {
       const cleanRawConfig = cleanAccountIdsRecursively(widget.rawConfiguration || {}, srcAccId, tgtAccId);
 
       const cleanWidget = {

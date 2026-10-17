@@ -13,8 +13,36 @@ import {
   fetchUserTagsForEntities,
   copyUserTagsToEntity,
   resolveTagsForItem,
-  mergeTagSets
+  mergeTagSets,
+  inspectDashboardWidgets
 } from '../utils';
+
+/**
+ * Turns the widget inspection into a sentence for the progress row, or '' when there is
+ * nothing to say. Shared by the live and import paths so both report it identically.
+ */
+export function describeWidgetIssues(report) {
+  const notes = [];
+
+  if (report.inaccessible.length > 0) {
+    const where = [...new Set(report.inaccessible.map(w => w.page))].join(', ');
+    notes.push(
+      `${report.inaccessible.length} of ${report.total} widget(s) could not be copied because ` +
+      `New Relic would not return their configuration - you do not have access to what they query ` +
+      `(page: ${where}). Recreate them by hand; everything else on those pages came across.`
+    );
+  }
+
+  if (report.customViz.length > 0) {
+    const kinds = [...new Set(report.customViz.map(w => w.vizId))].join(', ');
+    notes.push(
+      `${report.customViz.length} widget(s) use a custom visualization (${kinds}). They are copied, ` +
+      `but will only render if that nerdpack is also deployed in the target account.`
+    );
+  }
+
+  return notes.join(' ');
+}
 
 /**
  * Every source entity a dashboard was built from.
@@ -49,11 +77,18 @@ export async function runLiveDashboardMigration({
       const details = await fetchSourceDashboard(client, parent.guid);
       let input = null;
 
-      if (details.pages && details.pages.length > 1) {
+      if (!parent.isOrphan) {
+        // The dashboard's own entity holds every one of its pages, so copying it is enough -
+        // and is the only way to keep page names and order exactly as they are.
+        //
+        // This used to be gated on `details.pages.length > 1`, which sent every SINGLE-page
+        // dashboard down the merge path below and renamed its page to "Overview". Verified
+        // against five accounts: in all 30 dashboards the parent entity's page list is
+        // complete, so there is nothing to merge.
         input = mapEntityToDashboardInput(details, sourceAccountId, targetAccountId);
       } else if (parent.pagesToMigrate && parent.pagesToMigrate.length > 1) {
-        // Legacy tabbed dashboard: several sibling entities named "Parent / Page". Merge
-        // them into one multi-page dashboard, de-duplicating page names.
+        // No parent entity at all - the dashboard exists only as "Parent / Page" entities.
+        // Merge them into one multi-page dashboard, de-duplicating page names.
         const combinedPages = [];
         const addedPageNames = new Set();
 
@@ -90,6 +125,18 @@ export async function runLiveDashboardMigration({
         input = mapEntityToDashboardInput(details, sourceAccountId, targetAccountId);
       }
 
+      // Checked before the create so a dashboard made entirely of unreadable widgets fails with
+      // the reason rather than quietly arriving empty.
+      const widgetReport = inspectDashboardWidgets({ pages: input.pages });
+      const sourceReport = inspectDashboardWidgets(details);
+      if (sourceReport.total > 0 && sourceReport.copyable === 0) {
+        throw new Error(
+          `Every one of its ${sourceReport.total} widget(s) is inaccessible - New Relic returned no ` +
+          `configuration for any of them, so there is nothing to copy. This usually means the ` +
+          `dashboard queries accounts you do not have access to.`
+        );
+      }
+
       const result = await createTargetDashboard(client, targetAccountId, input);
 
       const preserved = sourceGuidsFor(parent).reduce(
@@ -109,6 +156,17 @@ export async function runLiveDashboardMigration({
           });
           continue;
         }
+      }
+
+      // Widgets that could not be copied make this a partial success, not a clean one - the
+      // dashboard exists but is missing panels, and that has to be visible.
+      const widgetNote = describeWidgetIssues(sourceReport);
+      if (widgetNote) {
+        onProgress(i, {
+          status: 'MANUAL',
+          error: `Migrated (new GUID ${result.guid})${tagNote}, with ${widgetReport.total} of ${sourceReport.total} widget(s) copied. ${widgetNote}`
+        });
+        continue;
       }
 
       onProgress(i, { status: 'SUCCESS', detail: `Migrated (new GUID ${result.guid})${tagNote}` });

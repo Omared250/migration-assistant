@@ -408,9 +408,12 @@ export default function DashboardsModule({ client, connection, updateConnection,
             renderItem={(db) => (
               <>
                 <strong>{db.name}</strong>
-                {db.pagesToMigrate.length > 1 && (
-                  <span className="badge-tabs">Legacy tab group ({db.pagesToMigrate.length} pages)</span>
-                )}
+                {/* The count is page ENTITIES grouped under this dashboard. They are pages of
+                    it, not separate dashboards, and all of them travel with it. Only an
+                    orphan (no parent entity) actually has to be reassembled from them. */}
+                {db.isOrphan
+                  ? <span className="badge-tabs">Rebuilt from {db.pagesToMigrate.length} page entities</span>
+                  : db.pageCount > 1 && <span className="badge-tabs">{db.pageCount - 1} page(s)</span>}
               </>
             )}
           />

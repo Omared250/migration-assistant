@@ -20,9 +20,10 @@ import {
   copyUserTagsToEntity,
   resolveTagsForItem,
   mergeTagSets,
-  isSelected
+  isSelected,
+  inspectDashboardWidgets
 } from '../utils';
-import { sourceGuidsFor } from './runLiveMigration';
+import { sourceGuidsFor, describeWidgetIssues } from './runLiveMigration';
 
 /**
  * Reads full definitions for the selected dashboards, consolidating legacy tab groups the
@@ -52,9 +53,10 @@ export async function gatherDashboardsForExport({ client, selected, newTags = []
       const details = await fetchSourceDashboard(client, parent.guid);
       const userTags = tagsFor(parent);
 
-      // Legacy tabbed dashboards arrive as several sibling entities named "Parent / Page".
-      // Consolidate them here so the bundle holds one dashboard, not one per tab.
-      if ((!details.pages || details.pages.length <= 1) && parent.pagesToMigrate?.length > 1) {
+      // Only when there is no parent entity at all does the dashboard have to be rebuilt from
+      // its "Parent / Page" entities. Whenever a parent exists its own page list is complete,
+      // so it is exported as-is - see the note in runLiveMigration.
+      if (parent.isOrphan && parent.pagesToMigrate?.length > 1) {
         const pages = [];
         const seen = new Set();
 
@@ -89,7 +91,20 @@ export async function gatherDashboardsForExport({ client, selected, newTags = []
         variables: details.variables || [],
         ...(userTags.length > 0 ? { userTags } : {})
       });
-      onLog({ stepName: parent.name, status: 'SUCCESS', detail: `Exported (${(details.pages || []).length} page(s))`, error: '' });
+
+      // Flagged at export as well as import: the widgets are unreadable in THIS account, so
+      // this is where the user can still do something about it.
+      const report = inspectDashboardWidgets(details);
+      const note = describeWidgetIssues(report);
+      if (note) {
+        warnings.push(`Dashboard "${parent.name}": ${note}`);
+        onLog({
+          stepName: parent.name, status: 'MANUAL', detail: '',
+          error: `Exported ${(details.pages || []).length} page(s), but ${report.inaccessible.length} widget(s) could not be read. ${note}`
+        });
+      } else {
+        onLog({ stepName: parent.name, status: 'SUCCESS', detail: `Exported (${(details.pages || []).length} page(s))`, error: '' });
+      }
     } catch (e) {
       onLog({ stepName: parent.name, status: 'FAILED', detail: '', error: e.message });
       warnings.push(`Dashboard "${parent.name}" could not be exported: ${e.message}`);
@@ -132,6 +147,15 @@ export async function applyDashboardsBundle({
     onProgress(i, { status: 'MIGRATING' });
 
     try {
+      const bundleReport = inspectDashboardWidgets(dashboard);
+      if (bundleReport.total > 0 && bundleReport.copyable === 0) {
+        throw new Error(
+          `Every one of its ${bundleReport.total} widget(s) was recorded as inaccessible when the ` +
+          `bundle was exported, so there is nothing to create. Re-export it from an account that ` +
+          `can read those widgets.`
+        );
+      }
+
       // Reuse the live path's mappers so the accountId rewriting rules stay in one place.
       const input = mapEntityToDashboardInput(
         {
@@ -166,6 +190,17 @@ export async function applyDashboardsBundle({
           });
           continue;
         }
+      }
+
+      // The bundle stores pages exactly as read, so an inaccessible widget recorded at export
+      // is still in here - dropped by the mapper above, and reported the same way.
+      const widgetNote = describeWidgetIssues(bundleReport);
+      if (widgetNote) {
+        onProgress(i, {
+          status: 'MANUAL',
+          error: `Created (GUID ${result.guid})${tagNote}, with ${bundleReport.copyable} of ${bundleReport.total} widget(s). ${widgetNote}`
+        });
+        continue;
       }
 
       onProgress(i, { status: 'SUCCESS', detail: `Created (GUID ${result.guid})${tagNote}` });
