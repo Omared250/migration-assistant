@@ -23,6 +23,7 @@ import {
   isSelected,
   inspectDashboardWidgets,
   countSingleAccountProps,
+  buildProvenanceTags,
   ACCOUNT_ID_MODE
 } from '../utils';
 import { sourceGuidsFor, describeWidgetIssues, describeSingleAccountWidgets } from './runLiveMigration';
@@ -176,12 +177,17 @@ export async function applyDashboardsBundle({
 
       // Tags recorded at export, merged with anything the importer is adding now. Targeting
       // here is by name - the only identifier a bundle carries.
-      const tags = resolveTagsForItem({
-        preserved: dashboard.userTags,
-        newTags,
-        targets: newTagTargets,
-        itemId: dashboard.name
-      });
+      // No source GUID here by design - the bundle carries none - so provenance records the
+      // source account and the date only.
+      const tags = mergeTagSets(
+        resolveTagsForItem({
+          preserved: dashboard.userTags,
+          newTags,
+          targets: newTagTargets,
+          itemId: dashboard.name
+        }),
+        buildProvenanceTags({ sourceAccountId })
+      );
 
       let tagNote = '';
       if (tags.length > 0) {

@@ -1300,6 +1300,136 @@ export function mergeTagSets(preserved, added) {
 }
 
 /**
+ * Tags recording where a migrated dashboard came from.
+ *
+ * Written on every dashboard this tool creates, with no option to turn them off: they are what
+ * makes a later run able to tell an already-migrated dashboard from a new one, and they are the
+ * only audit trail of where a copy originated. Creating a dashboard carries no provenance of
+ * its own - `createdBy` becomes whoever ran the migration.
+ *
+ * `migrated_from_guid` identifies the exact source dashboard, so it survives a rename on either
+ * side. It is only available on the live path: a bundle deliberately carries no source GUIDs,
+ * so an imported dashboard records the source ACCOUNT and date only.
+ *
+ * The date is deliberately day-resolution. A full timestamp would make every re-run write a
+ * different value for the same migration, which is noise in a tag.
+ */
+export function buildProvenanceTags({ sourceAccountId, sourceGuid, at = new Date() }) {
+  const tags = [];
+
+  const account = parseInt(sourceAccountId, 10);
+  if (Number.isFinite(account)) {
+    tags.push({ key: 'migrated_from_account', values: [String(account)] });
+  }
+  if (sourceGuid) {
+    tags.push({ key: 'migrated_from_guid', values: [String(sourceGuid)] });
+  }
+  tags.push({ key: 'migrated_at', values: [at.toISOString().slice(0, 10)] });
+
+  return tags;
+}
+
+/**
+ * What has already been migrated INTO an account, read back from the provenance tags.
+ *
+ * Returns two lookups:
+ *   bySourceGuid     source dashboard GUID -> { name, guid, at }. Exact: survives a rename on
+ *                    either side, and only the live path can use it because a bundle carries
+ *                    no source GUIDs.
+ *   byAccountAndName "<sourceAccount>|<lowercased name>" -> { ... }. For the import pass,
+ *                    where the account and the name are all the bundle has.
+ *
+ * Only dashboards carrying provenance are fetched, so this costs one narrow search rather than
+ * a sweep of the whole target account. A failure here returns an empty index: not knowing is a
+ * missing suggestion, and must never block a migration.
+ */
+export async function fetchProvenanceIndex(client, accountId) {
+  const empty = { bySourceGuid: new Map(), byAccountAndName: new Map(), available: false };
+
+  const numericAccountId = parseInt(accountId, 10);
+  if (!Number.isFinite(numericAccountId)) return empty;
+
+  const queryStr =
+    `type = 'DASHBOARD' AND accountId = ${numericAccountId} AND tags.migrated_from_account LIKE '%'`;
+
+  const query = `
+    query MigratedDashboards($queryStr: String!, $cursor: String) {
+      actor {
+        entitySearch(query: $queryStr) {
+          results(cursor: $cursor) {
+            nextCursor
+            entities {
+              guid
+              name
+              tags {
+                key
+                values
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  let entities;
+  try {
+    entities = await collectAllPages(async (cursor) => {
+      const data = await client.query(query, { queryStr, cursor }, { tolerateFieldErrors: true });
+      const page = data?.actor?.entitySearch?.results;
+      return { items: page?.entities || [], nextCursor: page?.nextCursor };
+    });
+  } catch (e) {
+    console.warn(`Could not check what has already been migrated: ${e.message}`);
+    return empty;
+  }
+
+  const bySourceGuid = new Map();
+  const byAccountAndName = new Map();
+
+  for (const entity of entities) {
+    const tagValue = (key) => (entity.tags || []).find(t => t.key === key)?.values?.[0] || null;
+    const record = {
+      name: entity.name,
+      guid: entity.guid,
+      at: tagValue('migrated_at'),
+      sourceAccount: tagValue('migrated_from_account')
+    };
+
+    const sourceGuid = tagValue('migrated_from_guid');
+    if (sourceGuid) bySourceGuid.set(sourceGuid, record);
+
+    if (record.sourceAccount) {
+      byAccountAndName.set(`${record.sourceAccount}|${(entity.name || '').trim().toLowerCase()}`, record);
+    }
+  }
+
+  return { bySourceGuid, byAccountAndName, available: true };
+}
+
+/**
+ * Marks each discovered dashboard with what the target account already holds for it.
+ *
+ * Identified by source GUID when one is available (the live path) and by source account plus
+ * name otherwise (import). Only annotates - the user still decides.
+ */
+export function annotateAlreadyMigrated(dashboards, index, { sourceAccountId } = {}) {
+  if (!index?.available) return dashboards;
+
+  return dashboards.map(d => {
+    const byGuid = d.guid ? index.bySourceGuid.get(d.guid) : null;
+    const byName = index.byAccountAndName.get(
+      `${parseInt(sourceAccountId, 10)}|${(d.name || '').trim().toLowerCase()}`
+    );
+    const hit = byGuid || byName;
+
+    return hit
+      ? { ...d, alreadyMigrated: { ...hit, matchedBy: byGuid ? 'guid' : 'name' } }
+      : d;
+  });
+}
+
+/**
  * The tags a single migrated item should end up with: what it carried in the source, plus
  * whatever the user is adding to it in this run.
  *

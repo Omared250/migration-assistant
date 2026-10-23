@@ -16,6 +16,7 @@ import {
   mergeTagSets,
   inspectDashboardWidgets,
   countSingleAccountProps,
+  buildProvenanceTags,
   ACCOUNT_ID_MODE
 } from '../utils';
 
@@ -161,7 +162,13 @@ export async function runLiveDashboardMigration({
       const preserved = sourceGuidsFor(parent).reduce(
         (acc, guid) => mergeTagSets(acc, tagsByGuid.get(guid) || []), []
       );
-      const tags = resolveTagsForItem({ preserved, newTags, targets: newTagTargets, itemId: parent.guid });
+
+      // Provenance goes on last so it wins over a copied or user-entered tag of the same name -
+      // it records a fact about this migration, not a preference.
+      const tags = mergeTagSets(
+        resolveTagsForItem({ preserved, newTags, targets: newTagTargets, itemId: parent.guid }),
+        buildProvenanceTags({ sourceAccountId, sourceGuid: parent.guid })
+      );
 
       let tagNote = '';
       if (tags.length > 0) {

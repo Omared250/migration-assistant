@@ -10,7 +10,10 @@
 // access verified at the moment of migration.
 
 import React, { useState } from 'react';
-import { discoverDashboards, isSelected, ACCOUNT_ID_MODE } from './utils';
+import {
+  discoverDashboards, isSelected, ACCOUNT_ID_MODE,
+  fetchProvenanceIndex, annotateAlreadyMigrated
+} from './utils';
 import {
   ModuleNavBar, AccountConfigGrid, SingleAccountConfig, BundleDropzone,
   BundleSummary, LoadingCard, ErrorCard, WarningList, SelectableList, StatusRow,
@@ -53,6 +56,8 @@ export default function DashboardsModule({ client, connection, updateConnection,
 
   const [bundle, setBundle] = useState(null);
   const [selectedNames, setSelectedNames] = useState({});
+  // The bundle's dashboards after the already-migrated check, so the list can badge them.
+  const [bundleDashboards, setBundleDashboards] = useState([]);
 
   // New tags the user is adding in this run. Owned by this module, so nothing entered here can
   // reach the alerts migration. Tags a dashboard already had are copied unconditionally and are
@@ -68,7 +73,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
 
   /** The dashboards this run will create, as the tag picker's item list. */
   const taggableItems = isImport
-    ? (bundle?.payload?.dashboards || []).filter(d => isSelected(selectedNames, d.name)).map(d => ({ id: d.name, name: d.name }))
+    ? bundleDashboards.filter(d => isSelected(selectedNames, d.name)).map(d => ({ id: d.name, name: d.name }))
     : discovered.filter(d => selectedGuids[d.guid]).map(d => ({ id: d.guid, name: d.name }));
 
   const resetToSetup = () => {
@@ -79,6 +84,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
     setProgress([]);
     setWarnings([]);
     setSelectedNames({});
+    setBundleDashboards([]);
   };
 
   const chooseScenario = (choice) => {
@@ -127,11 +133,22 @@ export default function DashboardsModule({ client, connection, updateConnection,
       // that knows how many dashboards were scanned and which tags the account actually uses.
       const list = await discoverDashboards(client, sourceAccountId, { type: filterType, keyword, tagKey, tagValue });
 
+      // Only meaningful when a target account is known, which is the live path. Export has no
+      // target yet, so there is nothing to compare against.
+      let annotated = list;
+      if (isLive) {
+        const index = await fetchProvenanceIndex(client, targetAccountId);
+        annotated = annotateAlreadyMigrated(list, index, { sourceAccountId });
+      }
+
+      // Already-migrated dashboards start UNTICKED. Migrating one again is legitimate - a
+      // second copy in the other account-ID mode, for instance - so they are listed and
+      // explained rather than hidden or refused.
       const selection = {};
-      list.forEach(item => { selection[item.guid] = true; });
+      annotated.forEach(item => { selection[item.guid] = !item.alreadyMigrated; });
 
       guard(() => {
-        setDiscovered(list);
+        setDiscovered(annotated);
         setSelectedGuids(selection);
         setStep(1);
       });
@@ -227,10 +244,18 @@ export default function DashboardsModule({ client, connection, updateConnection,
     setErrorMsg('');
     try {
       await verifySingleAccount(client, targetAccountId);
+
+      // Matched on source account + name here: the bundle carries no source GUIDs.
+      const index = await fetchProvenanceIndex(client, targetAccountId);
+      const annotated = annotateAlreadyMigrated(
+        bundle.payload.dashboards || [], index, { sourceAccountId: bundle.source?.accountId }
+      );
+
       const names = {};
-      (bundle.payload.dashboards || []).forEach(d => { names[d.name] = true; });
+      annotated.forEach(d => { names[d.name] = !d.alreadyMigrated; });
 
       guard(() => {
+        setBundleDashboards(annotated);
         setSelectedNames(names);
         setStep(1);
       });
@@ -243,7 +268,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
   };
 
   const handleImport = async () => {
-    const chosen = (bundle.payload.dashboards || []).filter(d => isSelected(selectedNames, d.name));
+    const chosen = bundleDashboards.filter(d => isSelected(selectedNames, d.name));
     if (chosen.length === 0) {
       alert('Select at least one dashboard to import.');
       return;
@@ -276,7 +301,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
   const toggleName = (name) => setSelectedNames(prev => ({ ...prev, [name]: !prev[name] }));
   const toggleAllNames = (all) => {
     const updated = {};
-    (bundle?.payload?.dashboards || []).forEach(d => { updated[d.name] = all; });
+    bundleDashboards.forEach(d => { updated[d.name] = all; });
     setSelectedNames(updated);
   };
 
@@ -294,6 +319,42 @@ export default function DashboardsModule({ client, connection, updateConnection,
    * pass. Export does not appear here because it stores dashboards exactly as read; the choice
    * belongs to whoever imports the bundle.
    */
+  /** The listed dashboards the target account already holds a copy of. */
+  const alreadyMigratedList = (isImport ? bundleDashboards : discovered).filter(d => d.alreadyMigrated);
+
+  const alreadyMigratedNotice = alreadyMigratedList.length > 0 && (
+    <div className="warning-card">
+      <h4>ℹ️ {alreadyMigratedList.length} dashboard(s) look like they were migrated already</h4>
+      <p>
+        Account {targetAccountId} already holds a dashboard this tool created from each of these,
+        according to the <code>migrated_from_*</code> tags it writes. They are{' '}
+        <strong>unticked</strong> — tick one again only if you want a second copy.
+      </p>
+      <ul className="warning-list">
+        {alreadyMigratedList.map(d => (
+          <li key={d.guid || d.name}>
+            <strong>{d.name}</strong>
+            {/* The copy in the target can have been renamed since, so name it when it differs -
+                otherwise the user has nothing to go and look at. */}
+            {d.alreadyMigrated.name && d.alreadyMigrated.name.trim() !== (d.name || '').trim() && (
+              <> → now called <strong>{d.alreadyMigrated.name}</strong> there</>
+            )}
+            {d.alreadyMigrated.at && <> · migrated {d.alreadyMigrated.at}</>}
+            {d.alreadyMigrated.matchedBy === 'name' && <> · matched by name, not by ID</>}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+
+  /** Badge for a dashboard the target already holds. */
+  const migratedBadge = (d) => d.alreadyMigrated && (
+    <span className="badge-tabs">
+      Already migrated{d.alreadyMigrated.at ? ` — ${d.alreadyMigrated.at}` : ''}
+      {d.alreadyMigrated.matchedBy === 'name' ? ' (matched by name)' : ''}
+    </span>
+  );
+
   const accountModeSection = (
     <div className="filter-strategy-section">
       <h4>Account IDs in widget queries</h4>
@@ -451,6 +512,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
             Found <strong>{discovered.length}</strong> parent dashboard(s).
             {scenario === SCENARIO.EXPORT ? ' Checked items go into the bundle.' : ' Checked items are migrated.'}
           </p>
+          {alreadyMigratedNotice}
           <SelectableList
             items={discovered}
             idOf={(d) => d.guid}
@@ -472,6 +534,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
                 {db.matchedOnPage && (
                   <span className="badge-tabs">matched page: {db.matchedOnPage}</span>
                 )}
+                {migratedBadge(db)}
               </>
             )}
           />
@@ -491,8 +554,9 @@ export default function DashboardsModule({ client, connection, updateConnection,
           <p className="card-desc">
             The bundle holds <strong>{(bundle.payload.dashboards || []).length}</strong> dashboard(s) from account {bundle.source?.accountId}.
           </p>
+          {alreadyMigratedNotice}
           <SelectableList
-            items={bundle.payload.dashboards || []}
+            items={bundleDashboards}
             idOf={(d) => d.name}
             selectedIds={selectedNames}
             onToggle={toggleName}
@@ -502,6 +566,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
               <>
                 <strong>{d.name}</strong> <span className="checklist-guid">({(d.pages || []).length} page(s))</span>
                 {d.consolidatedFrom > 1 && <span className="badge-tabs">Consolidated from {d.consolidatedFrom} tabs</span>}
+                {migratedBadge(d)}
               </>
             )}
           />
