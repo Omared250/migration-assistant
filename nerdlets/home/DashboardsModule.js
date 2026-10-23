@@ -10,7 +10,7 @@
 // access verified at the moment of migration.
 
 import React, { useState } from 'react';
-import { discoverDashboards, isSelected } from './utils';
+import { discoverDashboards, isSelected, ACCOUNT_ID_MODE } from './utils';
 import {
   ModuleNavBar, AccountConfigGrid, SingleAccountConfig, BundleDropzone,
   BundleSummary, LoadingCard, ErrorCard, WarningList, SelectableList, StatusRow,
@@ -58,6 +58,10 @@ export default function DashboardsModule({ client, connection, updateConnection,
   // reach the alerts migration. Tags a dashboard already had are copied unconditionally and are
   // not part of this.
   const [tagPlan, setTagPlan] = useState(emptyTagPlan());
+
+  // What happens to the source account id inside widget queries. REPLACE is the default and the
+  // original behaviour; ADD keeps the source and adds the target so widgets query both.
+  const [accountIdMode, setAccountIdMode] = useState(ACCOUNT_ID_MODE.REPLACE);
 
   const { sourceAccountId, targetAccountId } = connection;
   const isImport = scenario === SCENARIO.IMPORT;
@@ -153,6 +157,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
     await runLiveDashboardMigration({
       client, sourceAccountId, targetAccountId, selected,
       ...resolveTagPlan(tagPlan, taggableItems),
+      accountIdMode,
       onProgress: updateProgress
     });
 
@@ -255,6 +260,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
       selections: selectedNames,
       sourceAccountId: bundle.source?.accountId,
       ...resolveTagPlan(tagPlan, taggableItems),
+      accountIdMode,
       onProgress: updateProgress
     });
 
@@ -282,6 +288,51 @@ export default function DashboardsModule({ client, connection, updateConnection,
       </div>
     );
   }
+
+  /**
+   * Shown wherever widget queries actually get rewritten - the live migration and the import
+   * pass. Export does not appear here because it stores dashboards exactly as read; the choice
+   * belongs to whoever imports the bundle.
+   */
+  const accountModeSection = (
+    <div className="filter-strategy-section">
+      <h4>Account IDs in widget queries</h4>
+      <div className="radio-group-container">
+        {[
+          [ACCOUNT_ID_MODE.REPLACE, `Point queries at the target account only`],
+          [ACCOUNT_ID_MODE.ADD, `Query both accounts (keep the source, add the target)`]
+        ].map(([value, text]) => (
+          <label className="radio-label" key={value}>
+            <input
+              type="radio"
+              name="accountIdMode"
+              value={value}
+              checked={accountIdMode === value}
+              onChange={() => setAccountIdMode(value)}
+            />
+            {text}
+          </label>
+        ))}
+      </div>
+
+      {accountIdMode === ACCOUNT_ID_MODE.REPLACE ? (
+        <p className="field-hint">
+          The source account ID is swapped for the target's wherever it appears in a widget query.
+          Any other account a widget already queried is left alone.
+        </p>
+      ) : (
+        <div className="warning-card" style={{ marginBottom: 0 }}>
+          <h4>⚠️ Both accounts must be queryable from the target</h4>
+          <p>
+            The source account ID is kept and the target's added, so each widget queries both. This
+            only works where the account you are migrating into has access to the source account —
+            which is <strong>never the case across different organizations</strong>. In that
+            situation the widgets will load the target's data and error on the source's.
+          </p>
+        </div>
+      )}
+    </div>
+  );
 
   const filterSection = (
     <div className="filter-strategy-section">
@@ -346,6 +397,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
             onTargetChange={(v) => updateConnection({ targetAccountId: v })}
           />
           {filterSection}
+          {accountModeSection}
           <div className="button-group">
             <button onClick={handleDiscover} className="pure-btn primary-btn">Search &amp; Fetch Dashboards</button>
           </div>
@@ -453,6 +505,7 @@ export default function DashboardsModule({ client, connection, updateConnection,
               </>
             )}
           />
+          {accountModeSection}
           <TagAssignment noun="dashboards" items={taggableItems} plan={tagPlan} setPlan={setTagPlan} />
           <div className="button-group">
             <button onClick={resetToSetup} className="pure-btn plain-btn">Back</button>

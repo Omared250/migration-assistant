@@ -463,36 +463,100 @@ function assertAccountIds(sourceAccountId, targetAccountId) {
  * Only `accountId` and `accountIds` are touched, and only when they actually hold the source
  * account - a widget deliberately querying a third account is left alone.
  */
-function cleanAccountIdsRecursively(obj, srcAccId, tgtAccId) {
+/**
+ * What to do with the source account reference inside a widget query.
+ *
+ *   REPLACE  the source account id becomes the target's. The migrated dashboard reads only the
+ *            target account - the original behaviour, and the right default.
+ *   ADD      the source account id is KEPT and the target's is added alongside it, so the
+ *            widget queries both. Requires the target account to actually have access to the
+ *            source account, which is never true across organizations.
+ */
+export const ACCOUNT_ID_MODE = { REPLACE: 'REPLACE', ADD: 'ADD' };
+
+/**
+ * True for an object that is a NRQL query definition.
+ *
+ * Every one of them is exactly { accountId | accountIds, query } - measured across 390 real
+ * query objects with no exceptions. The `query` sibling is what separates a NRQL account
+ * reference, which has a documented multi-account array form, from a custom visualization's
+ * own `accountId` property, which does not.
+ */
+const isNrqlQueryObject = (obj) =>
+  Object.prototype.hasOwnProperty.call(obj, 'query');
+
+function cleanAccountIdsRecursively(obj, srcAccId, tgtAccId, mode = ACCOUNT_ID_MODE.REPLACE) {
   if (!obj || typeof obj !== 'object') {
     return obj;
   }
 
   if (Array.isArray(obj)) {
-    return obj.map(item => cleanAccountIdsRecursively(item, srcAccId, tgtAccId));
+    return obj.map(item => cleanAccountIdsRecursively(item, srcAccId, tgtAccId, mode));
   }
 
+  const adding = mode === ACCOUNT_ID_MODE.ADD;
   const cleanObj = {};
+
   for (const [key, value] of Object.entries(obj)) {
     if (key === 'accountIds' && Array.isArray(value)) {
-      // Swap the source for the target in place, preserving order and any other accounts the
-      // widget legitimately queries. Appending unconditionally is what produced
-      // [source, target] pairs before.
-      const updatedIds = value.map(id => {
-        const parsed = parseInt(id, 10);
-        return parsed === srcAccId ? tgtAccId : parsed;
-      });
+      const parsedIds = value.map(id => parseInt(id, 10)).filter(Number.isFinite);
+
+      const updatedIds = adding
+        // Keep every account the widget already queried and add the target.
+        ? [...parsedIds, tgtAccId]
+        // Swap the source for the target in place, preserving order and any other accounts the
+        // widget legitimately queries. Appending unconditionally is what produced
+        // [source, target] pairs before.
+        : parsedIds.map(id => (id === srcAccId ? tgtAccId : id));
 
       // A query with no accounts at all cannot render; fall back to the target.
       cleanObj[key] = updatedIds.length > 0 ? [...new Set(updatedIds)] : [tgtAccId];
     } else if (key === 'accountId') {
       const parsed = parseInt(value, 10);
-      cleanObj[key] = parsed === srcAccId ? tgtAccId : value;
+
+      if (adding && isNrqlQueryObject(obj)) {
+        // Promoted to the plural form, which is the only way one query can span two accounts.
+        // Safe because no object carries both keys - verified across every real widget.
+        const base = Number.isFinite(parsed) ? [parsed] : [];
+        cleanObj.accountIds = [...new Set([...base, tgtAccId])];
+      } else {
+        // Either REPLACE, or a single-account property belonging to a custom visualization.
+        // Those have no array form - the nerdpack reads a scalar - so adding is not possible
+        // and the reference is re-pointed instead. countSingleAccountProps() reports it.
+        cleanObj[key] = parsed === srcAccId ? tgtAccId : value;
+      }
     } else {
-      cleanObj[key] = cleanAccountIdsRecursively(value, srcAccId, tgtAccId);
+      cleanObj[key] = cleanAccountIdsRecursively(value, srcAccId, tgtAccId, mode);
     }
   }
   return cleanObj;
+}
+
+/**
+ * Widgets holding an `accountId` that is NOT part of a NRQL query - a custom visualization's
+ * own single-account property. In ADD mode these cannot query two accounts, so they are
+ * re-pointed to the target and reported rather than silently behaving differently from the
+ * rest of the dashboard.
+ */
+export function countSingleAccountProps(entity) {
+  const hits = [];
+
+  const walk = (obj, widget, page) => {
+    if (!obj || typeof obj !== 'object') return;
+    if (Array.isArray(obj)) return obj.forEach(x => walk(x, widget, page));
+
+    if (Object.prototype.hasOwnProperty.call(obj, 'accountId') && !isNrqlQueryObject(obj)) {
+      hits.push({ page, title: widget || '(untitled)' });
+    }
+    for (const [key, value] of Object.entries(obj)) {
+      if (key !== 'accountId' && key !== 'accountIds') walk(value, widget, page);
+    }
+  };
+
+  for (const page of entity?.pages || []) {
+    for (const w of page.widgets || []) walk(w.rawConfiguration, w.title, page.name);
+  }
+  return hits;
 }
 
 /**
@@ -597,7 +661,9 @@ export function inspectDashboardWidgets(entity) {
   return { total, copyable: total - inaccessible.length, inaccessible, customViz };
 }
 
-export function mapPageToDashboardPageInput(page, sourceAccountId, targetAccountId) {
+export function mapPageToDashboardPageInput(
+  page, sourceAccountId, targetAccountId, { accountIdMode = ACCOUNT_ID_MODE.REPLACE } = {}
+) {
   if (!page) return null;
 
   const { srcAccId, tgtAccId } = assertAccountIds(sourceAccountId, targetAccountId);
@@ -608,7 +674,7 @@ export function mapPageToDashboardPageInput(page, sourceAccountId, targetAccount
     // sending one fails the entire page - so keeping them would cost every other widget on it.
     // An empty widget list is valid input, so a page made entirely of them still comes across.
     widgets: (page.widgets || []).filter(w => !isInaccessibleWidget(w)).map(widget => {
-      const cleanRawConfig = cleanAccountIdsRecursively(widget.rawConfiguration || {}, srcAccId, tgtAccId);
+      const cleanRawConfig = cleanAccountIdsRecursively(widget.rawConfiguration || {}, srcAccId, tgtAccId, accountIdMode);
 
       const cleanWidget = {
         title: widget.title || "",
@@ -641,7 +707,10 @@ export function mapPageToDashboardPageInput(page, sourceAccountId, targetAccount
  * unless `rewriteVariableAccountIds` is explicitly requested. Widening this beyond the
  * account swap means the tool changes definitions nobody asked it to change.
  */
-export function mapEntityToDashboardInput(entity, sourceAccountId, targetAccountId, { rewriteVariableAccountIds = false } = {}) {
+export function mapEntityToDashboardInput(
+  entity, sourceAccountId, targetAccountId,
+  { rewriteVariableAccountIds = false, accountIdMode = ACCOUNT_ID_MODE.REPLACE } = {}
+) {
   if (!entity) return null;
 
   return {
@@ -649,7 +718,9 @@ export function mapEntityToDashboardInput(entity, sourceAccountId, targetAccount
     // Preserved as-is. The dashboard is not made more permissive just to be editable - a
     // widget that will not open is an account-reference problem, not a permissions one.
     permissions: entity.permissions || "PUBLIC_READ_WRITE",
-    pages: (entity.pages || []).map(page => mapPageToDashboardPageInput(page, sourceAccountId, targetAccountId)),
+    pages: (entity.pages || []).map(page =>
+      mapPageToDashboardPageInput(page, sourceAccountId, targetAccountId, { accountIdMode })
+    ),
     variables: mapVariables(entity.variables, sourceAccountId, targetAccountId, { rewriteAccountIds: rewriteVariableAccountIds })
   };
 }

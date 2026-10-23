@@ -14,13 +14,30 @@ import {
   copyUserTagsToEntity,
   resolveTagsForItem,
   mergeTagSets,
-  inspectDashboardWidgets
+  inspectDashboardWidgets,
+  countSingleAccountProps,
+  ACCOUNT_ID_MODE
 } from '../utils';
 
 /**
  * Turns the widget inspection into a sentence for the progress row, or '' when there is
  * nothing to say. Shared by the live and import paths so both report it identically.
  */
+/**
+ * In ADD mode, widgets whose account reference has no multi-account form. They are re-pointed
+ * to the target like REPLACE mode would, so saying nothing would leave the user believing the
+ * whole dashboard queries both accounts.
+ */
+export function describeSingleAccountWidgets(hits, accountIdMode) {
+  if (accountIdMode !== ACCOUNT_ID_MODE.ADD || hits.length === 0) return '';
+
+  const where = [...new Set(hits.map(h => h.page))].join(', ');
+  return (
+    `${hits.length} widget(s) use a custom visualization that accepts only ONE account, so they ` +
+    `point at the target account alone rather than both (page: ${where}).`
+  );
+}
+
 export function describeWidgetIssues(report) {
   const notes = [];
 
@@ -59,10 +76,12 @@ export function sourceGuidsFor(parent) {
 /**
  * @param {object[]} args.newTags       [{ key, values }] the user is adding in this run, or []
  * @param {object}   args.newTagTargets { [dashboardGuid]: true }, or null for every dashboard
+ * @param {string}   args.accountIdMode REPLACE (swap the source account) or ADD (query both)
  * @param {function} args.onProgress    (index, patch) => void
  */
 export async function runLiveDashboardMigration({
-  client, sourceAccountId, targetAccountId, selected, newTags = [], newTagTargets = null, onProgress
+  client, sourceAccountId, targetAccountId, selected, newTags = [], newTagTargets = null,
+  accountIdMode = ACCOUNT_ID_MODE.REPLACE, onProgress
 }) {
   // Source tags for everything being migrated, in as few requests as possible. Creating a
   // dashboard does not carry its tags over - DashboardInput has no tag field - so they are
@@ -85,7 +104,7 @@ export async function runLiveDashboardMigration({
         // dashboard down the merge path below and renamed its page to "Overview". Verified
         // against five accounts: in all 30 dashboards the parent entity's page list is
         // complete, so there is nothing to merge.
-        input = mapEntityToDashboardInput(details, sourceAccountId, targetAccountId);
+        input = mapEntityToDashboardInput(details, sourceAccountId, targetAccountId, { accountIdMode });
       } else if (parent.pagesToMigrate && parent.pagesToMigrate.length > 1) {
         // No parent entity at all - the dashboard exists only as "Parent / Page" entities.
         // Merge them into one multi-page dashboard, de-duplicating page names.
@@ -107,7 +126,7 @@ export async function runLiveDashboardMigration({
             if (addedPageNames.has(cleanName.toLowerCase())) continue;
 
             addedPageNames.add(cleanName.toLowerCase());
-            const mappedPage = mapPageToDashboardPageInput(innerPage, sourceAccountId, targetAccountId);
+            const mappedPage = mapPageToDashboardPageInput(innerPage, sourceAccountId, targetAccountId, { accountIdMode });
             if (mappedPage) {
               mappedPage.name = cleanName;
               combinedPages.push(mappedPage);
@@ -122,7 +141,7 @@ export async function runLiveDashboardMigration({
           variables: mapVariables(details.variables || [], sourceAccountId, targetAccountId)
         };
       } else {
-        input = mapEntityToDashboardInput(details, sourceAccountId, targetAccountId);
+        input = mapEntityToDashboardInput(details, sourceAccountId, targetAccountId, { accountIdMode });
       }
 
       // Checked before the create so a dashboard made entirely of unreadable widgets fails with
@@ -160,7 +179,11 @@ export async function runLiveDashboardMigration({
 
       // Widgets that could not be copied make this a partial success, not a clean one - the
       // dashboard exists but is missing panels, and that has to be visible.
-      const widgetNote = describeWidgetIssues(sourceReport);
+      const widgetNote = [
+        describeWidgetIssues(sourceReport),
+        describeSingleAccountWidgets(countSingleAccountProps(details), accountIdMode)
+      ].filter(Boolean).join(' ');
+
       if (widgetNote) {
         onProgress(i, {
           status: 'MANUAL',

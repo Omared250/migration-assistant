@@ -21,9 +21,11 @@ import {
   resolveTagsForItem,
   mergeTagSets,
   isSelected,
-  inspectDashboardWidgets
+  inspectDashboardWidgets,
+  countSingleAccountProps,
+  ACCOUNT_ID_MODE
 } from '../utils';
-import { sourceGuidsFor, describeWidgetIssues } from './runLiveMigration';
+import { sourceGuidsFor, describeWidgetIssues, describeSingleAccountWidgets } from './runLiveMigration';
 
 /**
  * Reads full definitions for the selected dashboards, consolidating legacy tab groups the
@@ -125,7 +127,8 @@ export function buildDashboardImportTaskList(payload, selections) {
  * one. `sourceAccountId` comes from the bundle envelope.
  */
 export async function applyDashboardsBundle({
-  client, accountId, payload, selections, sourceAccountId, newTags = [], newTagTargets = null, onProgress
+  client, accountId, payload, selections, sourceAccountId, newTags = [], newTagTargets = null,
+  accountIdMode = ACCOUNT_ID_MODE.REPLACE, onProgress
 }) {
   const chosen = (payload.dashboards || []).filter(d => isSelected(selections, d.name));
 
@@ -165,7 +168,8 @@ export async function applyDashboardsBundle({
           variables: dashboard.variables
         },
         sourceAccountId,
-        accountId
+        accountId,
+        { accountIdMode }
       );
 
       const result = await createTargetDashboard(client, accountId, input);
@@ -194,7 +198,11 @@ export async function applyDashboardsBundle({
 
       // The bundle stores pages exactly as read, so an inaccessible widget recorded at export
       // is still in here - dropped by the mapper above, and reported the same way.
-      const widgetNote = describeWidgetIssues(bundleReport);
+      const widgetNote = [
+        describeWidgetIssues(bundleReport),
+        describeSingleAccountWidgets(countSingleAccountProps(dashboard), accountIdMode)
+      ].filter(Boolean).join(' ');
+
       if (widgetNote) {
         onProgress(i, {
           status: 'MANUAL',
