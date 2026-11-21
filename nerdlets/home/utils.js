@@ -2494,12 +2494,43 @@ function remapMutingRuleConditions(rule, { policyIdMap, conditionIdMap, sourceAc
  * mutually exclusive, weeklyRepeatDays only applies to WEEKLY, and nextStartTime /
  * nextEndTime are read-only and must never be echoed back.
  */
+/**
+ * Converts a muting rule schedule timestamp into the form the API will accept back.
+ *
+ * The schedule fields are `NaiveDateTime` - a wall-clock time with no zone, interpreted in the
+ * rule's own `timeZone`. But READING a rule returns them with a zone designator and
+ * milliseconds (`2026-07-02T23:59:59.999Z`), and the resolver then refuses exactly that:
+ *
+ *   end_time 2026-07-02T23:59:59.999Z cannot be parsed. Please specify end_time in ISO 8601 format.
+ *
+ * So a rule could never be copied with its schedule intact. The designator is dropped rather
+ * than converted: the value is already the local time the `timeZone` field describes, so
+ * stripping `Z` preserves the window for any time zone, while treating it as a real UTC instant
+ * and converting would shift every non-UTC rule by its offset.
+ */
+function toNaiveDateTime(value, fieldName) {
+  if (value == null || value === '') return undefined;
+
+  const naive = String(value).trim()
+    .replace(/(?:Z|[+-]\d{2}:?\d{2})$/i, '')   // zone designator the read added
+    .replace(/\.\d+$/, '');                     // fractional seconds
+
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(naive)) {
+    throw new Error(
+      `Its schedule has a ${fieldName} the API will not accept (${JSON.stringify(value)}). ` +
+      `Recreate this rule by hand.`
+    );
+  }
+
+  return naive;
+}
+
 function buildMutingScheduleInput(schedule) {
   if (!schedule) return undefined;
 
   const out = {};
-  if (schedule.startTime) out.startTime = schedule.startTime;
-  if (schedule.endTime) out.endTime = schedule.endTime;
+  if (schedule.startTime) out.startTime = toNaiveDateTime(schedule.startTime, 'start time');
+  if (schedule.endTime) out.endTime = toNaiveDateTime(schedule.endTime, 'end time');
   if (schedule.timeZone) out.timeZone = schedule.timeZone;
 
   if (schedule.repeat) {
@@ -2511,7 +2542,8 @@ function buildMutingScheduleInput(schedule) {
 
     // Prefer endRepeat when both are somehow present; sending both is rejected.
     if (schedule.endRepeat) {
-      out.endRepeat = schedule.endRepeat;
+      // Also a NaiveDateTime, so it needs the same treatment.
+      out.endRepeat = toNaiveDateTime(schedule.endRepeat, 'repeat end');
     } else if (schedule.repeatCount != null) {
       out.repeatCount = parseInt(schedule.repeatCount, 10);
     }

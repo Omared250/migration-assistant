@@ -67,7 +67,10 @@ function extractErrorDetail(e) {
  */
 const NOISY_ERROR_KEYS = new Set([
   'message', 'locations', 'stack', 'source', 'positions', 'nodes', 'originalError',
-  'extensions', 'path'
+  'extensions', 'path',
+  // Rendered separately by formatGraphQLErrors as nested messages - dumping them here as well
+  // would print the same reason twice.
+  'graphQLErrors', 'networkError', 'clientErrors', 'protocolErrors', 'cause'
 ]);
 
 const MAX_DUMPED_ERROR_CHARS = 600;
@@ -122,26 +125,29 @@ function dumpUnknownError(e) {
 export function formatGraphQLErrors(errorLike) {
   const list = Array.isArray(errorLike) ? errorLike : [errorLike];
 
+  let anyDetail = false;
+  // Whether any entry was an API error object at all. A plain string thrown by our own code has
+  // no payload logged for it, so pointing at the console would be a dead end.
+  let anyStructured = false;
+
   const render = (e) => {
     if (!e) return null;
     if (typeof e === 'string') return e;
+    anyStructured = true;
 
     const base = e.message || e.description || 'GraphQL error';
     const detail = extractErrorDetail(e);
     const path = Array.isArray(e.path) ? ` (at ${e.path.join('.')})` : '';
 
-    // When the API gave us nothing but a terse message, say where the full response is. The
-    // mutate/query wrappers log it with the request variables, so the answer exists - the user
-    // just has no way of knowing that from the message alone.
-    const hint = detail ? '' : ' - the API returned no further detail; the full response and the' +
-      ' submitted payload are logged in the browser console (DevTools > Console).';
-
-    return `${base}${detail ? `: ${detail}` : ''}${path}${hint}`;
+    if (detail) anyDetail = true;
+    return `${base}${detail ? `: ${detail}` : ''}${path}`;
   };
 
   const messages = list.map(render).filter(Boolean);
 
-  // Apollo wraps network errors; surface the inner GraphQL errors when present.
+  // Apollo wraps network errors; surface the inner GraphQL errors when present. An ApolloError
+  // carries only a copy of the first message itself - the extensions holding the actual reason
+  // live down here.
   const nested = list
     .filter(e => e && typeof e === 'object')
     .flatMap(e => e.graphQLErrors || e.networkError?.result?.errors || []);
@@ -149,7 +155,16 @@ export function formatGraphQLErrors(errorLike) {
     messages.push(...nested.map(render).filter(Boolean));
   }
 
-  return [...new Set(messages)].join(' | ') || 'Unknown GraphQL error';
+  const combined = [...new Set(messages)].join(' | ') || 'Unknown GraphQL error';
+
+  // Only when NOTHING in the whole set yielded a reason: say where the full response is, since
+  // the query/mutate wrappers log it with the request payload. Judged across every error rather
+  // than per-error, or a terse outer message would claim "no further detail" immediately before
+  // a nested error supplied it.
+  if (anyDetail || !anyStructured) return combined;
+
+  return `${combined} - the API returned no further detail; the full response and the ` +
+    `submitted payload are logged in the browser console (DevTools > Console).`;
 }
 
 /**
@@ -180,11 +195,21 @@ export function createClient() {
     kind: 'session',
 
     async query(query, variables = {}, options = {}) {
-      const response = await NerdGraphQuery.query({
-        query,
-        variables,
-        fetchPolicyType: NerdGraphQuery.FETCH_POLICY_TYPE?.NO_CACHE
-      });
+      let response;
+      try {
+        response = await NerdGraphQuery.query({
+          query,
+          variables,
+          fetchPolicyType: NerdGraphQuery.FETCH_POLICY_TYPE?.NO_CACHE
+        });
+      } catch (thrown) {
+        // The SDK REJECTS for some failures instead of resolving with { error }. Those used to
+        // propagate untouched, so an ApolloError whose own message is just "Validation Error"
+        // reached the UI with its graphQLErrors - the only place the real reason lives -
+        // thrown away. Everything goes through the formatter now.
+        console.error('NerdGraph query rejected.', { variables: redactSecrets(variables), raw: thrown });
+        throw new Error(formatGraphQLErrors(thrown));
+      }
 
       if (response.error) {
         throw new Error(formatGraphQLErrors(response.error));
@@ -205,8 +230,6 @@ export function createClient() {
     },
 
     async mutate(mutation, variables = {}, label = 'mutation') {
-      const response = await NerdGraphMutation.mutate({ mutation, variables });
-
       const fail = (errorLike) => {
         // Log the payload alongside the raw error. When the API returns a terse
         // "Validation Error" this is the only way to see which field it rejected.
@@ -216,6 +239,16 @@ export function createClient() {
         });
         throw new Error(formatGraphQLErrors(errorLike));
       };
+
+      let response;
+      try {
+        response = await NerdGraphMutation.mutate({ mutation, variables });
+      } catch (thrown) {
+        // Same reason as in query() above: a rejected promise skipped this whole path, which
+        // is why a muting rule failure showed "Validation Error" and nothing else - not even
+        // a console entry to look at.
+        fail(thrown);
+      }
 
       if (response.error) fail(response.error);
       if (response.errors && response.errors.length > 0) fail(response.errors);
