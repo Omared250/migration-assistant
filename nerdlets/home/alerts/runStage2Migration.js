@@ -254,10 +254,15 @@ export async function runStage2Migration({
         conditionIdMap,
         sourceAccountId
       });
-      onProgress(idx, {
-        status: result.skipped ? 'SKIPPED' : 'SUCCESS',
-        detail: result.skipped ? 'Matched existing muting rule in target' : 'Created in target'
-      });
+      if (result.degradedReason) {
+        // Created, but switched off and not yet usable - not a clean success.
+        onProgress(idx, { status: 'MANUAL', error: `Created in target, but ${result.degradedReason}` });
+      } else {
+        onProgress(idx, {
+          status: result.skipped ? 'SKIPPED' : 'SUCCESS',
+          detail: result.skipped ? 'Matched existing muting rule in target' : 'Created in target'
+        });
+      }
     } catch (e) {
       // A rule that cannot be remapped is reported as needing manual work rather than as a
       // hard failure: leaving it behind is a real risk the user must see.

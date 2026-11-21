@@ -29,6 +29,7 @@ export default function Stage1Selection({
   mutingRules,
   selectedMutingRuleIds,
   setSelectedMutingRuleIds,
+  filterNotice,
   onBack,
   onNext
 }) {
@@ -43,8 +44,21 @@ export default function Stage1Selection({
 
   return (
     <div className="main-card">
-      <h3>Stage 1: Select Destinations, Workflows & Muting Rules</h3>
-      <p className="card-desc">Choose which communication endpoints, event triggers and muting windows are migrated.</p>
+      <h3>Step 2: Select Destinations, Workflows &amp; Muting Rules</h3>
+      <p className="card-desc">Choose which communication endpoints, event triggers and muting windows are migrated. These are created first, because a workflow needs its target channel and a muting rule needs its target policies.</p>
+
+      {/* Without this, a keyword or tag filter looks like it applied here too - the lists below
+          are the account's full inventory, and there is nothing on screen to say so. */}
+      {filterNotice && (
+        <div className="warning-card">
+          <h4>ℹ️ Your filter does not apply to this stage</h4>
+          <p>
+            {filterNotice} That filter narrows the <strong>policies and conditions</strong> offered
+            in Stage 2 only. The destinations, workflows and muting rules below are this account's
+            <strong> complete inventory</strong> — they are not related to what you searched for.
+          </p>
+        </div>
+      )}
 
       <div className="alerts-subtabs">
         <button className={`subtab-btn ${tab === 'DESTINATIONS' ? 'active' : ''}`} onClick={() => setTab('DESTINATIONS')}>
@@ -102,7 +116,7 @@ export default function Stage1Selection({
           <p className="card-desc">
             Muting rules silence alerts during known windows. If they are left behind, the target
             account will page people for windows that are deliberately quiet in the source.
-            Rules are created after the policies they reference, in Stage 2.
+            Rules are created last, after the policies they reference.
           </p>
 
           <SelectableList
@@ -121,8 +135,8 @@ export default function Stage1Selection({
       )}
 
       <div className="button-group">
-        <button onClick={onBack} className="pure-btn plain-btn">Back</button>
-        <button onClick={onNext} className="pure-btn primary-btn">Deploy Setup & Proceed to Stage 2</button>
+        <button onClick={onBack} className="pure-btn plain-btn">Back to Conditions</button>
+        <button onClick={onNext} className="pure-btn primary-btn">Migrate Everything Selected</button>
       </div>
     </div>
   );

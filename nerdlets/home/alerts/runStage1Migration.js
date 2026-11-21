@@ -136,24 +136,33 @@ export async function runStage1Migration({
     }
   }
 
-  // 3. Discover policies & conditions for the Stage 2 checklist, honouring the chosen filter.
-  const { policies, filtered, matchedConditionIds, unmigratable } =
-    await discoverPolicyTree(sourceClient, sourceAccountId, criteria);
+  return { mappedChannels };
+}
 
-  // Identify conditions this tool cannot migrate, so Stage 2 can say so up front rather
-  // than reporting a clean success on a half-copied policy.
+/**
+ * Reads the policies and conditions a migration could offer, honouring the chosen filter.
+ *
+ * Split out of the destination/channel creation above so that SELECTION can happen in a
+ * different order from CREATION. Creation order is forced by dependencies - a workflow needs a
+ * target channel id, a muting rule needs target policy ids - but nothing stops the user being
+ * asked about conditions first, which is the only order in which the keyword/tag filter makes
+ * any sense. This function writes nothing.
+ */
+export async function discoverAlertsForSelection({ client, accountId, criteria = { type: 'ALL' } }) {
+  const { policies, filtered, matchedConditionIds, unmigratable } =
+    await discoverPolicyTree(client, accountId, criteria);
+
+  // Conditions this tool cannot migrate, so the picker can say so up front rather than
+  // reporting a clean success on a half-copied policy.
   //
   // Only meaningful for an unfiltered run: the account-wide entity sweep would otherwise
   // report every condition outside the filter as "not migrated", which is true but useless.
   // A filtered run reports the unsupported conditions the filter actually matched instead.
-  let nonNrqlReport = { supported: true, conditions: [] };
+  const nonNrqlReport = filtered
+    ? { supported: true, conditions: unmigratable }
+    : await discoverNonNrqlConditions(
+        client, accountId, policies.flatMap(p => (p.conditions || []).map(c => c.id))
+      );
 
-  if (filtered) {
-    nonNrqlReport = { supported: true, conditions: unmigratable };
-  } else {
-    const allNrqlIds = policies.flatMap(p => (p.conditions || []).map(c => c.id));
-    nonNrqlReport = await discoverNonNrqlConditions(sourceClient, sourceAccountId, allNrqlIds);
-  }
-
-  return { mappedChannels, policies, nonNrqlReport, filtered, matchedConditionIds, unmigratable };
+  return { policies, nonNrqlReport, filtered, matchedConditionIds, unmigratable };
 }

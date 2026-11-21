@@ -6,9 +6,16 @@
 //   EXPORT  signed into the source: read everything and download a bundle
 //   IMPORT  signed into the target: upload a bundle and create from it
 //
-// The LIVE path keeps its two stages because creation order is forced by dependencies:
-//   Stage 1  destinations -> channels          (a workflow needs a target channel id)
-//   Stage 2  policies + conditions -> workflows -> muting rules
+// LIVE asks in the order that makes sense to a person and then writes in the order the API
+// demands - the two are not the same:
+//
+//   asked    1. policies + conditions (what the keyword/tag filter applies to)
+//            2. destinations, workflows, muting rules
+//   written  destinations -> channels -> policies + conditions -> workflows -> muting rules
+//
+// Selection order is free because selection only reads. Creation order is not: a workflow needs
+// a target channel id and a muting rule needs target policy ids. Everything is read before the
+// first pick and nothing is written until the last one, so backing out writes nothing.
 // IMPORT applies the same chain in one pass, since the bundle already holds everything.
 
 import React, { useState } from 'react';
@@ -22,7 +29,7 @@ import { useMountedGuard } from './hooks';
 import { verifyMigrationAccess, verifySingleAccount } from './access';
 import ScenarioPicker, { SCENARIO } from './ScenarioPicker';
 import { createBundle, downloadBundle, BUNDLE_KIND } from './bundle';
-import { runStage1Migration } from './alerts/runStage1Migration';
+import { runStage1Migration, discoverAlertsForSelection } from './alerts/runStage1Migration';
 import { runStage2Migration, buildStage2TaskList } from './alerts/runStage2Migration';
 import Stage1Selection from './alerts/Stage1Selection';
 import Stage2Selection from './alerts/Stage2Selection';
@@ -210,6 +217,14 @@ export default function AlertsModule({ client, connection, updateConnection, onE
     try {
       await verifyMigrationAccess({ client, sourceAccountId, targetAccountId });
 
+      // Everything is read up front - policies and conditions included - so the user can be
+      // asked about conditions FIRST. Nothing is written until they have seen all of it.
+      const tree = await discoverAlertsForSelection({ client, accountId: sourceAccountId, criteria: criteria() });
+
+      if (tree.filtered && tree.policies.length === 0) {
+        throw new Error(`No conditions matched ${describeFilter()} in account ${sourceAccountId}.`);
+      }
+
       const { destinations: dests } = await fetchDestinationsAndChannels(client, sourceAccountId);
       const wfs = await discoverWorkflows(client, sourceAccountId);
 
@@ -222,13 +237,22 @@ export default function AlertsModule({ client, connection, updateConnection, onE
         console.warn(`Could not read muting rules: ${e.message}`);
       }
 
+      const allConditions = tree.policies.flatMap(p => p.conditions || []);
+
       guard(() => {
+        setPolicies(tree.policies);
+        setSelectedPolicyIds(selectAllById(tree.policies));
+        setSelectedConditionIds(selectAllById(allConditions));
+        setNonNrqlReport(tree.nonNrqlReport);
+        setFilterNotice(buildFilterNotice(tree));
+
         setDestinations(dests);
         setSelectedDestinationIds(selectAllById(dests));
         setWorkflows(wfs);
         setSelectedWorkflowIds(selectAllById(wfs));
         setMutingRules(rules);
         setSelectedMutingRuleIds(selectAllById(rules));
+
         setStep(1);
       });
     } catch (err) {
@@ -239,13 +263,25 @@ export default function AlertsModule({ client, connection, updateConnection, onE
     }
   };
 
-  const handleLiveStage1 = async () => {
+  /** Runs the whole chain: destinations & channels first, then policies, workflows, muting. */
+  const handleLiveMigrate = async () => {
+    const chosenPolicies = policies.filter(p => selectedPolicyIds[p.id]);
+    const chosenWorkflows = workflows.filter(w => selectedWorkflowIds[w.id]);
+    const chosenRules = mutingRules.filter(r => selectedMutingRuleIds[r.id]);
+
     setStep(3);
     setErrorMsg('');
     setNotifyProgress([]);
+    setAlertProgress(buildStage2TaskList({
+      policies: chosenPolicies, workflows: chosenWorkflows, mutingRules: chosenRules
+    }));
 
     const log = [];
+    let mapped = {};
     try {
+      // Phase 1 - destinations and channels. A workflow cannot be created without its target
+      // channel id, so this has to happen before the policies phase regardless of the order the
+      // user was asked in.
       const result = await runStage1Migration({
         sourceClient: client,
         targetClient: client,
@@ -253,50 +289,23 @@ export default function AlertsModule({ client, connection, updateConnection, onE
         targetAccountId,
         destinations,
         selectedDestinationIds,
-        selectedWorkflows: workflows.filter(w => selectedWorkflowIds[w.id]),
-        criteria: criteria(),
+        selectedWorkflows: chosenWorkflows,
         onLog: (entry) => {
           log.push(entry);
           guard(() => setNotifyProgress([...log]));
         }
       });
-
-      const allConditions = result.policies.flatMap(p => p.conditions || []);
-
-      guard(() => {
-        setMappedChannels(result.mappedChannels);
-        setPolicies(result.policies);
-        setSelectedPolicyIds(selectAllById(result.policies));
-        setSelectedConditionIds(selectAllById(allConditions));
-        setNonNrqlReport(result.nonNrqlReport);
-        setFilterNotice(buildFilterNotice(result));
-
-        // Destinations and channels were already created, so this is not a failed run - the
-        // filter simply matched nothing. Say so instead of showing an empty checklist.
-        if (result.filtered && result.policies.length === 0) {
-          setErrorMsg(`No conditions matched ${describeFilter()} in account ${sourceAccountId}. Stage 1 completed; adjust the filter and re-run Stage 1.`);
-        }
-        setStep(2);
-      });
+      mapped = result.mappedChannels;
+      guard(() => setMappedChannels(mapped));
     } catch (e) {
       guard(() => {
-        setErrorMsg(e.message);
-        setStep(1);
+        setErrorMsg(`Notification setup failed, so nothing further was attempted: ${e.message}`);
+        setStep(2);
       });
+      return;
     }
-  };
 
-  const handleLiveStage2 = async () => {
-    const chosenPolicies = policies.filter(p => selectedPolicyIds[p.id]);
-    const chosenWorkflows = workflows.filter(w => selectedWorkflowIds[w.id]);
-    const chosenRules = mutingRules.filter(r => selectedMutingRuleIds[r.id]);
-
-    setStep(3);
-    setErrorMsg('');
-    setAlertProgress(buildStage2TaskList({
-      policies: chosenPolicies, workflows: chosenWorkflows, mutingRules: chosenRules
-    }));
-
+    // Phase 2 - policies and conditions, then workflows, then muting rules.
     await runStage2Migration({
       sourceClient: client,
       targetClient: client,
@@ -306,7 +315,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
       selectedConditionIds,
       workflows: chosenWorkflows,
       mutingRules: chosenRules,
-      mappedChannels,
+      mappedChannels: mapped,
       ...resolveTagPlan(tagPlan, taggableItems),
       onProgress: updateAlertLog
     });
@@ -608,7 +617,7 @@ export default function AlertsModule({ client, connection, updateConnection, onE
         </div>
       )}
 
-      {step === 1 && scenario === SCENARIO.LIVE && (
+      {step === 2 && scenario === SCENARIO.LIVE && (
         <Stage1Selection
           destinations={destinations}
           selectedDestinationIds={selectedDestinationIds}
@@ -619,8 +628,9 @@ export default function AlertsModule({ client, connection, updateConnection, onE
           mutingRules={mutingRules}
           selectedMutingRuleIds={selectedMutingRuleIds}
           setSelectedMutingRuleIds={setSelectedMutingRuleIds}
-          onBack={resetToSetup}
-          onNext={handleLiveStage1}
+          filterNotice={filterType !== 'ALL' ? `You filtered by ${describeFilter()}.` : ''}
+          onBack={() => setStep(1)}
+          onNext={handleLiveMigrate}
         />
       )}
 
@@ -638,20 +648,19 @@ export default function AlertsModule({ client, connection, updateConnection, onE
         />
       )}
 
-      {step === 2 && scenario === SCENARIO.LIVE && (
+      {step === 1 && scenario === SCENARIO.LIVE && (
         <Stage2Selection
           policies={policies}
           selectedPolicyIds={selectedPolicyIds}
           setSelectedPolicyIds={setSelectedPolicyIds}
           selectedConditionIds={selectedConditionIds}
           setSelectedConditionIds={setSelectedConditionIds}
-          notifyProgress={notifyProgress}
           nonNrqlReport={nonNrqlReport}
           targetAccountId={targetAccountId}
           filterNotice={filterNotice}
           tagSection={<TagAssignment noun="conditions" items={taggableItems} plan={tagPlan} setPlan={setTagPlan} />}
-          onBack={() => setStep(1)}
-          onMigrate={handleLiveStage2}
+          onBack={resetToSetup}
+          onMigrate={() => setStep(2)}
         />
       )}
 

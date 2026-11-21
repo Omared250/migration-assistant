@@ -312,10 +312,16 @@ export async function gatherAlertsForExport({ client, accountId, inventory, sele
       return { attribute: c.attribute, operator: c.operator, values };
     });
 
+    // Carried into the bundle rather than dropped. The import creates it DISABLED with the
+    // reference intact, so the name, description, schedule and remaining conditions survive and
+    // the user has one field to re-point. Dropping the condition instead would widen the rule.
     if (unportable) {
-      log(`Muting rule: ${rule.name}`, 'MANUAL', '', `Targets specific source entities via "${unportable}", which has no equivalent in another organization. Recreate this rule by hand.`);
-      warnings.push(`Muting rule "${rule.name}" targets source entities directly and cannot be imported.`);
-      continue;
+      log(`Muting rule: ${rule.name}`, 'MANUAL', 'Exported, but will be created disabled',
+        `It filters on "${unportable}", which names an entity that exists only in this account. ` +
+        `On import it will be created disabled - re-point that reference and enable it there.`);
+      warnings.push(
+        `Muting rule "${rule.name}" filters on "${unportable}" and will arrive disabled; re-point it in the target account.`
+      );
     }
     if (unresolved.length > 0) {
       log(`Muting rule: ${rule.name}`, 'MANUAL', '', `References ${[...new Set(unresolved)].join(', ')} that could not be resolved to a name.`);
@@ -327,10 +333,12 @@ export async function gatherAlertsForExport({ client, accountId, inventory, sele
       name: rule.name,
       description: rule.description,
       enabled: rule.enabled,
+      actionOnMutingRuleWindowEnded: rule.actionOnMutingRuleWindowEnded,
       schedule: rule.schedule,
       condition: { operator: group.operator || 'AND', conditions }
     });
-    log(`Muting rule: ${rule.name}`, 'SUCCESS', 'Exported');
+    // An unportable rule already logged its own MANUAL row above; one row per rule.
+    if (!unportable) log(`Muting rule: ${rule.name}`, 'SUCCESS', 'Exported');
   }
 
   return {

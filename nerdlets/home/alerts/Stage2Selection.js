@@ -1,10 +1,13 @@
 // path: nerdlets/home/alerts/Stage2Selection.js
 //
-// Stage 2 picker: the policy/condition tree, preceded by the Stage 1 result log and the
-// warning about conditions that cannot be migrated. Holds no state.
+// Step 1 picker: the policy/condition tree, preceded by the warning about conditions that
+// cannot be migrated. Holds no state.
+//
+// This is the FIRST thing the user picks, because the keyword/tag filter applies to conditions -
+// asking about destinations first made the filter look like it had applied to them too. Nothing
+// is created at this point; the supporting items are chosen on the next step.
 
 import React from 'react';
-import { StatusRow } from '../components';
 import NonNrqlWarning from './NonNrqlWarning';
 import PolicyTree from './PolicyTree';
 
@@ -14,7 +17,6 @@ export default function Stage2Selection({
   setSelectedPolicyIds,
   selectedConditionIds,
   setSelectedConditionIds,
-  notifyProgress,
   nonNrqlReport,
   targetAccountId,
   filterNotice,
@@ -24,8 +26,8 @@ export default function Stage2Selection({
 }) {
   return (
     <div className="main-card">
-      <h3>Stage 2: Select Policies & Alert Conditions to Migrate</h3>
-      <p className="card-desc">Review and check exactly which Alert Policies and nested NRQL alert conditions are copied. Baseline conditions are recreated as baseline; static as static.</p>
+      <h3>Step 1: Select Policies &amp; Alert Conditions</h3>
+      <p className="card-desc">Review and check exactly which Alert Policies and nested NRQL alert conditions are copied. Baseline conditions are recreated as baseline; static as static. Nothing is written yet — the notification setup is chosen next.</p>
 
       {filterNotice && (
         <div className="warning-card">
@@ -34,14 +36,6 @@ export default function Stage2Selection({
         </div>
       )}
 
-      {notifyProgress.length > 0 && (
-        <div style={{ marginBottom: '24px' }}>
-          <h4 style={{ fontSize: '14px', margin: '0 0 8px 0' }}>Stage 1 result: notification destinations & channels</h4>
-          <div className="summary-list">
-            {notifyProgress.map((item, index) => <StatusRow key={index} item={item} />)}
-          </div>
-        </div>
-      )}
 
       <NonNrqlWarning report={nonNrqlReport} targetAccountId={targetAccountId} />
 
@@ -57,8 +51,8 @@ export default function Stage2Selection({
       {tagSection}
 
       <div className="button-group">
-        <button onClick={onBack} className="pure-btn plain-btn">Back to Stage 1</button>
-        <button onClick={onMigrate} className="pure-btn primary-btn">Migrate Selected Alerts System</button>
+        <button onClick={onBack} className="pure-btn plain-btn">Back</button>
+        <button onClick={onMigrate} className="pure-btn primary-btn">Next: Destinations, Workflows &amp; Muting Rules</button>
       </div>
     </div>
   );

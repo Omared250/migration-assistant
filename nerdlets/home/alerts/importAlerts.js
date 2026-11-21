@@ -297,6 +297,7 @@ export async function applyAlertsBundle({ client, accountId, payload, newTags = 
           name: rule.name,
           description: rule.description,
           enabled: rule.enabled,
+          actionOnMutingRuleWindowEnded: rule.actionOnMutingRuleWindowEnded,
           schedule: rule.schedule,
           condition: { operator: rule.condition?.operator || 'AND', conditions }
         },
@@ -304,7 +305,11 @@ export async function applyAlertsBundle({ client, accountId, payload, newTags = 
         { policyIdMap: {}, conditionIdMap: {}, sourceAccountId: accountId, identity: true }
       );
 
-      onProgress(idx, { status: created.skipped ? 'SKIPPED' : 'SUCCESS', detail: created.skipped ? 'Matched existing muting rule' : 'Created' });
+      if (created.degradedReason) {
+        onProgress(idx, { status: 'MANUAL', error: `Created, but ${created.degradedReason}` });
+      } else {
+        onProgress(idx, { status: created.skipped ? 'SKIPPED' : 'SUCCESS', detail: created.skipped ? 'Matched existing muting rule' : 'Created' });
+      }
     } catch (e) {
       onProgress(idx, { status: 'MANUAL', error: e.message });
     }

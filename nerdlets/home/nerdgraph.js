@@ -48,13 +48,71 @@ function extractErrorDetail(e) {
   }
 
   if (parts.length === 0) {
-    // Last resort: never swallow the payload. Strip the noisy bits Apollo adds.
+    // Strip the noisy bits Apollo adds, then fall through to dumping the whole error.
     const { code, classification, errorClass, ...rest } = ext;
-    const dump = Object.keys(rest).length > 0 ? JSON.stringify(rest) : null;
-    return [errorClass || classification || code, dump].filter(Boolean).join(' ') || null;
+    const dump = Object.keys(rest).length > 0 ? truncateDetail(JSON.stringify(rest)) : null;
+    const label = [errorClass || classification || code, dump].filter(Boolean).join(' ');
+    return label || dumpUnknownError(e);
   }
 
   return parts.join(' | ');
+}
+
+/**
+ * Already shown by the caller, or pure noise in a UI message.
+ *
+ * `path` is in here because formatGraphQLErrors renders it separately. Dumping it as "detail"
+ * made every terse error look like it had detail, which suppressed the console pointer below -
+ * exactly the case this whole fallback exists for.
+ */
+const NOISY_ERROR_KEYS = new Set([
+  'message', 'locations', 'stack', 'source', 'positions', 'nodes', 'originalError',
+  'extensions', 'path'
+]);
+
+const MAX_DUMPED_ERROR_CHARS = 600;
+
+/** Keeps a hostile or merely enormous payload from filling the UI. */
+function truncateDetail(text) {
+  if (typeof text !== 'string') return null;
+  return text.length > MAX_DUMPED_ERROR_CHARS
+    ? `${text.slice(0, MAX_DUMPED_ERROR_CHARS)}... (truncated)`
+    : text;
+}
+
+/**
+ * Everything the error carries apart from its message, as a string.
+ *
+ * The reason this exists: a NerdGraph resolver can answer with nothing but
+ * `message: "Validation Error"`, and whichever key holds the real reason is not guaranteed to
+ * be one of the shapes handled above. Returning null there left the UI showing those two words
+ * and nothing else, which cost a user a round-trip to work out which field was rejected. So
+ * anything unrecognised is dumped verbatim rather than dropped.
+ */
+function dumpUnknownError(e) {
+  if (!e || typeof e !== 'object') return null;
+
+  const picked = {};
+  for (const key of Object.keys(e)) {
+    if (NOISY_ERROR_KEYS.has(key)) continue;
+    picked[key] = e[key];
+  }
+  if (Object.keys(picked).length === 0) return null;
+
+  const seen = new WeakSet();
+  try {
+    const json = JSON.stringify(picked, (key, value) => {
+      if (value && typeof value === 'object') {
+        if (seen.has(value)) return '[circular]';
+        seen.add(value);
+      }
+      return value;
+    });
+    if (!json || json === '{}') return null;
+    return truncateDetail(json);
+  } catch (err) {
+    return null;
+  }
 }
 
 /**
@@ -72,7 +130,13 @@ export function formatGraphQLErrors(errorLike) {
     const detail = extractErrorDetail(e);
     const path = Array.isArray(e.path) ? ` (at ${e.path.join('.')})` : '';
 
-    return `${base}${detail ? `: ${detail}` : ''}${path}`;
+    // When the API gave us nothing but a terse message, say where the full response is. The
+    // mutate/query wrappers log it with the request variables, so the answer exists - the user
+    // just has no way of knowing that from the message alone.
+    const hint = detail ? '' : ' - the API returned no further detail; the full response and the' +
+      ' submitted payload are logged in the browser console (DevTools > Console).';
+
+    return `${base}${detail ? `: ${detail}` : ''}${path}${hint}`;
   };
 
   const messages = list.map(render).filter(Boolean);

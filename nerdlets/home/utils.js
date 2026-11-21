@@ -2374,6 +2374,10 @@ export async function discoverMutingRules(client, accountId) {
               name
               description
               enabled
+              # What happens to issues still open when the window closes. Part of the rule's
+              # behaviour, and it was neither read nor recreated - so a migrated rule silently
+              # fell back to the default. Matters most for the scheduled rules.
+              actionOnMutingRuleWindowEnded
               condition {
                 operator
                 conditions {
@@ -2417,25 +2421,38 @@ function remapMutingRuleConditions(rule, { policyIdMap, conditionIdMap, sourceAc
   // IDs valid in this account. Remapping them again would fail every lookup.
   if (identity) {
     return {
-      operator: group.operator || 'AND',
-      conditions: group.conditions.map(c => ({
-        attribute: c.attribute,
-        operator: c.operator,
-        values: (c.values || []).map(String)
-      }))
+      condition: {
+        operator: group.operator || 'AND',
+        conditions: group.conditions.map(c => ({
+          attribute: c.attribute,
+          operator: c.operator,
+          values: (c.values || []).map(String)
+        }))
+      },
+      unmappable: [...new Set(
+        group.conditions.map(c => c.attribute).filter(a => MUTING_ATTR_UNMAPPABLE.has(a))
+      )]
     };
   }
 
   const unresolved = [];
+  const unmappable = [];
 
   const conditions = group.conditions.map(c => {
     const attribute = c.attribute;
     const values = (c.values || []).map(String);
 
+    // An attribute naming a specific source entity cannot be translated - there is no
+    // equivalent entity in the target account. The reference is carried over UNCHANGED and the
+    // rule is created DISABLED (see createTargetMutingRule), rather than refused outright.
+    //
+    // Carrying it means the name, description, schedule and the rest of the condition group all
+    // survive, leaving the user one field to re-point instead of a rule to rebuild. Keeping the
+    // original value is also the safe choice: a rule that matches nothing is noisy, while
+    // DROPPING the condition would widen the rule and could silence everything.
     if (MUTING_ATTR_UNMAPPABLE.has(attribute)) {
-      throw new Error(
-        `It targets specific source entities via "${attribute}", which has no equivalent in account ${targetAccountId}. Recreate this rule by hand.`
-      );
+      unmappable.push(attribute);
+      return { attribute, operator: c.operator, values };
     }
 
     let mapped = values;
@@ -2466,7 +2483,10 @@ function remapMutingRuleConditions(rule, { policyIdMap, conditionIdMap, sourceAc
     );
   }
 
-  return { operator: group.operator || 'AND', conditions };
+  return {
+    condition: { operator: group.operator || 'AND', conditions },
+    unmappable: [...new Set(unmappable)]
+  };
 }
 
 /**
@@ -2518,15 +2538,23 @@ export async function createTargetMutingRule(client, accountId, rule, maps) {
     return { id: match.id, name: match.name, skipped: true };
   }
 
-  const condition = remapMutingRuleConditions(rule, { ...maps, targetAccountId: accountId });
+  const { condition, unmappable } = remapMutingRuleConditions(rule, { ...maps, targetAccountId: accountId });
   const schedule = buildMutingScheduleInput(rule.schedule);
+
+  // A rule carrying an untranslatable entity reference is created switched OFF. It cannot match
+  // anything until the reference is re-pointed, and a rule that matches nothing is safe - the
+  // alternative, dropping the condition, would broaden what the rule silences.
+  const degraded = unmappable.length > 0;
 
   const ruleInput = {
     name: rule.name,
-    enabled: rule.enabled !== false,
+    enabled: degraded ? false : rule.enabled !== false,
     condition
   };
   if (rule.description) ruleInput.description = rule.description;
+  if (rule.actionOnMutingRuleWindowEnded) {
+    ruleInput.actionOnMutingRuleWindowEnded = rule.actionOnMutingRuleWindowEnded;
+  }
   if (schedule) ruleInput.schedule = schedule;
 
   const mutation = `
@@ -2548,7 +2576,15 @@ export async function createTargetMutingRule(client, accountId, rule, maps) {
   if (!created?.id) {
     throw new Error(`Muting rule "${rule.name}" was not created (no rule returned).`);
   }
-  return created;
+
+  return {
+    ...created,
+    degradedReason: degraded
+      ? `it filters on ${unmappable.join(', ')}, which names entities that only exist in the ` +
+        `source account. The rule was created DISABLED with the original reference intact - ` +
+        `re-point it to an entity in account ${accountId} and enable it.`
+      : null
+  };
 }
 
 /*************************************************************
